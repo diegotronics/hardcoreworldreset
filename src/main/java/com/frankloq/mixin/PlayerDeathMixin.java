@@ -28,7 +28,10 @@ public abstract class PlayerDeathMixin {
 				player.getName().getString()
 		);
 
-		ci.cancel();
-		HardcoreWorldReset.handlePlayerDeath(player, damageSource);
+		// Only cancel the vanilla death when the mod takes over (last life -> world reset,
+		// or a reset is already running). Deaths with lives to spare stay fully vanilla.
+		if (HardcoreWorldReset.handlePlayerDeath(player, damageSource)) {
+			ci.cancel();
+		}
 	}
 }

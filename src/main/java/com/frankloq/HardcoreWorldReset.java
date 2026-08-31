@@ -34,6 +34,7 @@ public class HardcoreWorldReset implements ModInitializer {
 	private static int limboCountdownTicks = -1;
 	private static boolean modEnabled = true;
 	public static boolean reuseSeed = false; // Reuse the same seed for each reset.
+	public static int maxLives = 3; // Lives each player starts with. The world resets when someone loses their last one.
 	private static boolean scheduledResetActive = false; // Flag to indicate if a reset is currently scheduled
 	private static int scheduledResetTicks = -1; // scheduled reset
 	private static int initialScheduledMinutes = -1;// Store the initial minutes for accurate time remaining display
@@ -68,10 +69,40 @@ public class HardcoreWorldReset implements ModInitializer {
 	@Override
 	public void onInitialize() {
 		LOGGER.info("HardcoreWorldReset initialized.");
+		loadConfig();
 		ServerTickEvents.END_SERVER_TICK.register(this::onServerTick);
+
+		ServerLifecycleEvents.SERVER_STARTED.register(server -> {
+			LivesManager.load(server);
+			LivesManager.initScoreboard(server);
+		});
 
 		ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
 			WorldResetManager.guaranteeLevelDatOnShutdown(server);
+		});
+
+		// After a non-final death the player respawns through the vanilla flow;
+		// greet them with how many lives they have left.
+		net.fabricmc.fabric.api.entity.event.v1.ServerPlayerEvents.AFTER_RESPAWN.register((oldPlayer, newPlayer, alive) -> {
+			if (alive) return; // Ignore dimension-change "respawns" (e.g. leaving the End)
+
+			// Safety net for servers running hardcore=true, where vanilla respawns players as spectators
+			MinecraftServer server = newPlayer.getServer();
+			if (server != null && server.isHardcore() && newPlayer.isSpectator()) {
+				newPlayer.changeGameMode(GameMode.SURVIVAL);
+			}
+
+			LivesManager.syncPlayer(newPlayer);
+
+			int remaining = LivesManager.getLives(newPlayer);
+			String hearts = remaining <= 10 ? "§c❤".repeat(Math.max(remaining, 0)) : "§c" + remaining + " ❤";
+			String subtitle = remaining == 1
+					? "§cLast life! §7The next death erases the world."
+					: "§7You have §c" + remaining + " §7lives remaining.";
+
+			newPlayer.networkHandler.sendPacket(new net.minecraft.network.packet.s2c.play.TitleFadeS2CPacket(10, 60, 10));
+			newPlayer.networkHandler.sendPacket(new net.minecraft.network.packet.s2c.play.SubtitleS2CPacket(Text.literal(subtitle)));
+			newPlayer.networkHandler.sendPacket(new net.minecraft.network.packet.s2c.play.TitleS2CPacket(Text.literal(hearts)));
 		});
 
 		CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
@@ -192,6 +223,35 @@ public class HardcoreWorldReset implements ModInitializer {
 										);
 										return 1;
 									})))
+
+					// 8. lives (Shows everyone's remaining lives; no OP required)
+					.then(literal("lives")
+							.executes(context -> {
+								context.getSource().sendFeedback(() -> Text.literal("§e[Reset] §7Remaining lives:"), false);
+								for (ServerPlayerEntity p : context.getSource().getServer().getPlayerManager().getPlayerList()) {
+									int remaining = LivesManager.getLives(p);
+									context.getSource().sendFeedback(() -> Text.literal(
+											"§7- " + p.getName().getString() + ": §c" + remaining), false);
+								}
+								return 1;
+							}))
+
+					// 9. maxLives (Changes how many lives everyone gets and refills them)
+					.then(literal("maxLives")
+							.requires(source -> source.hasPermissionLevel(2))
+							.then(argument("value", integer(1, 100))
+									.executes(context -> {
+										int value = getInteger(context, "value");
+
+										maxLives = value;
+										saveConfig();
+										LivesManager.resetAllLives(context.getSource().getServer());
+
+										context.getSource().getServer().getPlayerManager().broadcast(
+												Text.literal("§a[Reset] §7max-lives set to §c" + value + "§7. Everyone's lives have been refilled!"), false
+										);
+										return 1;
+									})))
 			);
 		});
 
@@ -210,6 +270,13 @@ public class HardcoreWorldReset implements ModInitializer {
 				rescueQueue.put(player, 20);
 				HardcoreWorldReset.LOGGER.info("Player " + player.getName().getString() + " detected in Limbo. Rescue arriving in 1 second...");
 			}
+
+			// Show the joining player their lives on the Tab list and in chat
+			LivesManager.syncPlayer(player);
+			int remaining = LivesManager.getLives(player);
+			player.sendMessage(Text.literal(
+					"§7You have §c" + remaining + " §7" + (remaining == 1 ? "life" : "lives")
+							+ " §7remaining. Check the Tab list to see everyone's."), false);
 		});
 	}
 
@@ -337,14 +404,75 @@ public class HardcoreWorldReset implements ModInitializer {
 		}
 	}
 
-	public static void handlePlayerDeath(
+	// Returns true when the mod takes over the death (vanilla death must be cancelled):
+	// either this was the player's last life and the reset begins, or a reset is already running.
+	// Returns false for deaths with lives to spare, which stay fully vanilla (drops, death screen, respawn).
+	public static boolean handlePlayerDeath(
 			ServerPlayerEntity player,
 			DamageSource damageSource) {
 
 		LOGGER.info("Intercepting death for player: {}",
 				player.getName().getString());
 
-		// This happens for everyone who dies
+		MinecraftServer server = player.getServer();
+		if (server == null) return false;
+
+		// A reset is already counting down or running: don't touch their lives
+		// (they'll be refilled anyway), just freeze them until the Limbo trip
+		if (WorldResetManager.isResetting() || WorldResetManager.isCountdownLocked()) {
+			freezePlayerForReset(player);
+			player.sendMessage(Text.literal("§eA world reset is already in progress. Joining The Limbo..."), false);
+			return true;
+		}
+
+		int remaining = LivesManager.decrementLives(player);
+
+		if (remaining > 0) {
+			// Non-final death: let vanilla handle everything (death message, drops, respawn)
+			LOGGER.info("Player {} lost a life. {} remaining.", player.getName().getString(), remaining);
+
+			String warning = remaining == 1
+					? "§c" + player.getName().getString() + " §7is down to their §cLAST §7life!"
+					: "§7" + player.getName().getString() + " §7lost a life! §c" + remaining + " §7remaining.";
+			server.getPlayerManager().broadcast(Text.literal(warning), false);
+
+			return false;
+		}
+
+		// Final life spent: the world dies with them
+		freezePlayerForReset(player);
+
+		if (WorldResetManager.tryLockCountdown()) {
+
+			// Broadcast vanilla death message only for the first player
+			Text deathMessage = damageSource.getDeathMessage(player);
+			server.getPlayerManager().broadcast(deathMessage, false);
+
+			server.getPlayerManager().broadcast(
+					Text.literal("§c" + player.getName().getString() + " §7lost their §cfinal §7life!"),
+					false
+			);
+
+			resetInProgress = true;
+			limboCountdownTicks = 5 * 20;
+
+			server.getPlayerManager().broadcast(
+					Text.literal("§7Erasing the world in §c5 §7seconds..."),
+					false
+			);
+
+			LOGGER.info("World reset sequence started. Countdown: 5 seconds.");
+
+		} else {
+			// Someone else locked the countdown in this same tick
+			player.sendMessage(Text.literal("§eA world reset is already in progress. Joining The Limbo..."), false);
+		}
+
+		return true;
+	}
+
+	// Keeps a "dead" player alive and parked in spectator while the reset takes care of the rest
+	private static void freezePlayerForReset(ServerPlayerEntity player) {
 		// Restore health server-side
 		player.setHealth(20.0f);
 		player.getHungerManager().setFoodLevel(20);
@@ -367,30 +495,6 @@ public class HardcoreWorldReset implements ModInitializer {
 						3.0f
 				)
 		);
-
-		MinecraftServer server = player.getServer();
-		if (server == null) return;
-
-		if (WorldResetManager.tryLockCountdown()) {
-
-			// Broadcast vanilla death message only for the first player
-			Text deathMessage = damageSource.getDeathMessage(player);
-			server.getPlayerManager().broadcast(deathMessage, false);
-
-			resetInProgress = true;
-			limboCountdownTicks = 5 * 20;
-
-			server.getPlayerManager().broadcast(
-					Text.literal("§7Erasing the world in §c5 §7seconds..."),
-					false
-			);
-
-			LOGGER.info("World reset sequence started. Countdown: 5 seconds.");
-
-		} else {
-			// This runs for anyone else who dies while the countdown is already happening
-			player.sendMessage(Text.literal("§eA world reset is already in progress. Joining The Limbo..."), false);
-		}
 	}
 
 	private static void executeLimboTeleport(MinecraftServer server) {
@@ -463,6 +567,13 @@ public class HardcoreWorldReset implements ModInitializer {
 		// Respawn all players into the fresh world
 		PlayerRespawner.respawnAllPlayers(server);
 
+		// Fresh world, fresh lives for everyone
+		LivesManager.resetAllLives(server);
+		server.getPlayerManager().broadcast(
+				Text.literal("§7Everyone's lives restored to §c" + maxLives + "§7."),
+				false
+		);
+
 		// Broadcasts the try counter
 		server.getPlayerManager().broadcast(
 				Text.literal("§7Try §c#" + WorldResetManager.getCurrentTry(server)),
@@ -502,11 +613,22 @@ public class HardcoreWorldReset implements ModInitializer {
 					String showBar = props.getProperty("always-show-action-bar", "false");
 					alwaysShowActionBar = Boolean.parseBoolean(showBar);
 
-					LOGGER.info("Loaded config: reuse-same-seed = " + reuseSeed + ", always-show-action-bar = " + alwaysShowActionBar);
+					try {
+						maxLives = Math.max(1, Integer.parseInt(props.getProperty("max-lives", "3").trim()));
+					} catch (NumberFormatException e) {
+						maxLives = 3;
+						LOGGER.warn("Invalid max-lives value in config, falling back to 3.");
+					}
+
+					LOGGER.info("Loaded config: reuse-same-seed = " + reuseSeed
+							+ ", always-show-action-bar = " + alwaysShowActionBar
+							+ ", max-lives = " + maxLives);
 				}
 			} else {
-				// If it doesn't exist, create it with the default set to false
+				// If it doesn't exist, create it with the defaults
 				props.setProperty("reuse-same-seed", "false");
+				props.setProperty("always-show-action-bar", "false");
+				props.setProperty("max-lives", "3");
 				try (java.io.OutputStream out = java.nio.file.Files.newOutputStream(configFile)) {
 					props.store(out, "Hardcore World Reset Configuration");
 					LOGGER.info("Generated default config file.");
@@ -525,6 +647,7 @@ public class HardcoreWorldReset implements ModInitializer {
 
 			props.setProperty("reuse-same-seed", String.valueOf(reuseSeed));
 			props.setProperty("always-show-action-bar", String.valueOf(alwaysShowActionBar));
+			props.setProperty("max-lives", String.valueOf(maxLives));
 
 			try (java.io.OutputStream out = java.nio.file.Files.newOutputStream(configFile)) {
 				props.store(out, "Hardcore World Reset Configuration");

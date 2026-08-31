@@ -3,7 +3,7 @@
 	"id": "hardcoreworldreset",
 	"version": "${version}",
 	"name": "HardcoreWorldReset",
-	"description": "Erases the world and creates a new one each time a player dies.",
+	"description": "Every player gets a configurable number of lives (3 by default). When someone loses their last one, the world is erased and a new one is created.",
 	"authors": ["FrankLoq"],
 	"license": "CC0-1.0",
 	"environment": "*",

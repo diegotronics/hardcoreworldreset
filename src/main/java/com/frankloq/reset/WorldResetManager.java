@@ -52,6 +52,10 @@ public class WorldResetManager {
         countdownLocked = false;
     }
 
+    public static boolean isCountdownLocked() {
+        return countdownLocked;
+    }
+
     // Indestructible try counter system
     public static int getCurrentTry(MinecraftServer server) {
         if (!hasLoadedTryCount) loadTryCount(server);
