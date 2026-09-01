@@ -77,6 +77,9 @@ public class LivesManager {
         try {
             Properties props = new Properties();
             for (Map.Entry<UUID, Integer> entry : lives.entrySet()) {
+                // Players at full lives are the default already, so storing them would only
+                // grow the file forever with a row per player who ever joined.
+                if (entry.getValue() == HardcoreWorldReset.maxLives) continue;
                 props.setProperty(entry.getKey().toString(), String.valueOf(entry.getValue()));
             }
             try (OutputStream out = Files.newOutputStream(getLivesFile(server))) {

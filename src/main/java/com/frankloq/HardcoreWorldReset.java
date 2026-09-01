@@ -63,7 +63,20 @@ public class HardcoreWorldReset implements ModInitializer {
 			stopped = true;
 		}
 
+		// Whenever no reset pipeline is actually running, make sure the lock is free. This
+		// is the manual escape hatch if an aborted attempt ever leaves it held: without it
+		// the mod would look enabled while quietly refusing to reset again.
+		if (!WorldResetManager.isResetting()) {
+			WorldResetManager.unlockCountdown();
+		}
+
 		return stopped;
+	}
+
+	// True from the moment a reset is committed to until the new world is handed back,
+	// including the five second countdown before players are moved to Limbo.
+	public static boolean isResetImminent() {
+		return resetInProgress || WorldResetManager.isCountdownLocked();
 	}
 
 	@Override
@@ -528,6 +541,11 @@ public class HardcoreWorldReset implements ModInitializer {
 			);
 			resetInProgress = false;
 			limboCountdownTicks = -1;
+
+			// Release the countdown lock. tryLockCountdown() took it when this attempt
+			// started, and leaving it held makes every later reset fail silently for the
+			// rest of the server's life -- not even /hwr stopCountdown could clear it.
+			WorldResetManager.unlockCountdown();
 			return;
 		}
 
@@ -608,7 +626,7 @@ public class HardcoreWorldReset implements ModInitializer {
 				// If config exists, read it
 				try (java.io.InputStream in = java.nio.file.Files.newInputStream(configFile)) {
 					props.load(in);
-					String reuse = props.getProperty("reuse-same-seed", "true");
+					String reuse = props.getProperty("reuse-same-seed", "false");
 					reuseSeed = Boolean.parseBoolean(reuse);
 					String showBar = props.getProperty("always-show-action-bar", "false");
 					alwaysShowActionBar = Boolean.parseBoolean(showBar);

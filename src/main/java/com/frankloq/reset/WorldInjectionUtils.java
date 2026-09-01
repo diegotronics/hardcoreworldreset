@@ -35,7 +35,16 @@ public class WorldInjectionUtils {
                     }
                 }
             }
-        } catch (Exception e) {}
+
+            // Falling through means the seed never made it into memory, so the "new" world
+            // would regenerate identically to the old one. Say so instead of failing quietly.
+            com.frankloq.HardcoreWorldReset.LOGGER.error(
+                    "Could not find the seed field for {}. The world may regenerate with the old seed.",
+                    world.getRegistryKey().getValue()
+            );
+        } catch (Exception e) {
+            com.frankloq.HardcoreWorldReset.LOGGER.error("Failed to inject the new seed into memory", e);
+        }
     }
 
     public static void forceCloseRegionFiles(ServerWorld world) {
@@ -57,7 +66,9 @@ public class WorldInjectionUtils {
             }
             if (entityManager != null) deepClose(entityManager, 0, new HashSet<>());
 
-        } catch (Exception e) {}
+        } catch (Exception e) {
+            com.frankloq.HardcoreWorldReset.LOGGER.error("Failed to close the old world's region files", e);
+        }
     }
 
     private static void deepClose(Object target, int depth, Set<Object> visited) {
@@ -116,7 +127,9 @@ public class WorldInjectionUtils {
                     break;
                 }
             }
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            com.frankloq.HardcoreWorldReset.LOGGER.error("Failed to close a region file cache", e);
+        }
     }
 
     public static void clearAllEntities(ServerWorld world) {
@@ -154,7 +167,9 @@ public class WorldInjectionUtils {
                     }
                 }
             }
-        } catch (Exception e) {}
+        } catch (Exception e) {
+            com.frankloq.HardcoreWorldReset.LOGGER.error("Failed to reset the Ender Dragon fight", e);
+        }
     }
 
     // New way of getting rid of the chunks for 1.21 specifically...
@@ -227,46 +242,90 @@ public class WorldInjectionUtils {
             net.minecraft.server.world.ServerChunkManager manager = world.getChunkManager();
             Object chunkLoadingManager = manager.chunkLoadingManager;
 
-            // Target the chunk StorageIoWorker
-            Object chunkWorker = null;
-            for (Field field : chunkLoadingManager.getClass().getDeclaredFields()) {
-                if (field.getType().getSimpleName().equals("StorageIoWorker")) {
-                    field.setAccessible(true);
-                    chunkWorker = field.get(chunkLoadingManager);
+            // Every StorageIoWorker keeps a Map<ChunkPos, Result> of chunk writes that have been
+            // queued but not yet written to disk. Those queues have to be dropped before the region
+            // files are deleted, or the worker's background thread drains them afterwards and writes
+            // the old world's chunks straight back into the fresh files. In game that looks like
+            // slabs of old-seed terrain standing in the middle of the new world, with sheer walls
+            // where they meet the newly generated chunks.
+            //
+            // The workers are inherited fields: ServerChunkLoadingManager gets its from
+            // VersionedChunkStorage, and the POI and entity stores keep theirs further down still.
+            // getDeclaredFields() only sees fields declared on the class itself, so the old lookup
+            // matched nothing at all and silently left every queue intact.
+            java.util.List<Object> workers = new java.util.ArrayList<>();
+            Set<Object> visited = new HashSet<>();
+
+            collectIoWorkers(chunkLoadingManager, 0, visited, workers);
+            collectIoWorkers(world.getPointOfInterestStorage(), 0, visited, workers);
+
+            for (Field f : ServerWorld.class.getDeclaredFields()) {
+                if (f.getType() == ServerEntityManager.class) {
+                    f.setAccessible(true);
+                    collectIoWorkers(f.get(world), 0, visited, workers);
                     break;
                 }
             }
 
-            // Target the poi StorageIoWorker (this prevents ghost structures)
-            Object poiStorage = world.getPointOfInterestStorage();
-            Object poiWorker = null;
-            if (poiStorage != null) {
-                for (Field field : poiStorage.getClass().getDeclaredFields()) {
-                    if (field.getType().getSimpleName().equals("StorageIoWorker")) {
-                        field.setAccessible(true);
-                        poiWorker = field.get(poiStorage);
-                        break;
-                    }
-                }
+            if (workers.isEmpty()) {
+                com.frankloq.HardcoreWorldReset.LOGGER.warn(
+                        "Found no StorageIoWorker in {}. Queued writes from the old world may survive the reset.",
+                        world.getRegistryKey().getValue()
+                );
             }
 
             // Clear every cache, write-queue, and map inside the io workers
-            Object[] workers = {chunkWorker, poiWorker};
             for (Object worker : workers) {
-                if (worker == null) continue;
                 for (Field field : worker.getClass().getDeclaredFields()) {
-                    field.setAccessible(true);
-                    Object cacheObj = field.get(worker);
-                    if (cacheObj != null) {
-                        try {
+                    try {
+                        field.setAccessible(true);
+                        Object cacheObj = field.get(worker);
+                        if (cacheObj != null) {
                             // This instantly deletes the Map<ChunkPos, NbtCompound> buffers
                             cacheObj.getClass().getMethod("clear").invoke(cacheObj);
-                        } catch (Exception ignored) {}
-                    }
+                        }
+                    } catch (Exception ignored) {}
                 }
             }
+
+            com.frankloq.HardcoreWorldReset.LOGGER.info(
+                    "Dropped queued writes from {} io worker(s) in {}.",
+                    workers.size(), world.getRegistryKey().getValue()
+            );
         } catch (Exception e) {
             com.frankloq.HardcoreWorldReset.LOGGER.error("storage io lobotomy failed miserably", e);
+        }
+    }
+
+    // Collects every StorageIoWorker reachable from the given root, walking superclasses as well as
+    // declared fields so that inherited and nested workers are found too.
+    private static void collectIoWorkers(Object target, int depth, Set<Object> visited, java.util.List<Object> found) {
+        if (target == null || depth > 4 || !visited.add(target)) return;
+
+        if (target.getClass().getSimpleName().equals("StorageIoWorker")) {
+            found.add(target);
+            return;
+        }
+
+        // Never wander out into the rest of the server's object graph
+        if (target instanceof ServerWorld ||
+                target instanceof net.minecraft.server.MinecraftServer ||
+                target instanceof net.minecraft.server.PlayerManager ||
+                target instanceof ServerChunkManager) {
+            return;
+        }
+
+        Class<?> current = target.getClass();
+        while (current != null && current != Object.class) {
+            for (Field field : current.getDeclaredFields()) {
+                if (field.getType().isPrimitive()) continue;
+                if (!field.getType().getName().startsWith("net.minecraft")) continue;
+                try {
+                    field.setAccessible(true);
+                    collectIoWorkers(field.get(target), depth + 1, visited, found);
+                } catch (Exception ignored) {}
+            }
+            current = current.getSuperclass();
         }
     }
 

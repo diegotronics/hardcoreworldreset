@@ -18,7 +18,10 @@ public class PlayerLoginMixin {
      // If the world is actively resetting, this kicks the player at the connection screen.
     @Inject(method = "checkCanJoin", at = @At("HEAD"), cancellable = true)
     private void preventJoinDuringReset(SocketAddress address, GameProfile profile, CallbackInfoReturnable<Text> cir) {
-        if (WorldResetManager.isResetting()) {
+        // isResetting() only covers the erase-and-regenerate pipeline. The five second
+        // countdown before it runs left a window where someone could log in, load chunks of
+        // a world about to be deleted, and get dragged along into Limbo.
+        if (WorldResetManager.isResetting() || com.frankloq.HardcoreWorldReset.isResetImminent()) {
             cir.setReturnValue(Text.literal("§cThe world is currently resetting.\n§fPlease wait a few seconds and try again."));
         }
     }
