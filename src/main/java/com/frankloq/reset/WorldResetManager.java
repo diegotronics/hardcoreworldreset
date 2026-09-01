@@ -94,6 +94,9 @@ public class WorldResetManager {
             return;
         }
 
+        ResetPhase running = currentPhase;
+        long startedAt = System.currentTimeMillis();
+
         switch (currentPhase) {
             case UNLOADING -> executeUnloadPhase(server);
             case DELETING -> executeDeletionPhase(server);
@@ -101,6 +104,14 @@ public class WorldResetManager {
             case DONE -> executeDonePhase(server);
             default -> {
             }
+        }
+
+        // Every phase runs inside a single server tick, so a slow one eats into the
+        // dedicated server's max-tick-time budget. Log it to make the culprit obvious
+        // if the Watchdog ever shuts the server down mid-reset again.
+        long elapsed = System.currentTimeMillis() - startedAt;
+        if (elapsed > 1000) {
+            HardcoreWorldReset.LOGGER.warn("Phase {} held the server thread for {} ms.", running, elapsed);
         }
     }
 
@@ -165,12 +176,29 @@ public class WorldResetManager {
             );
         }
 
-        // Force save to pack the chunks securely to disk
-        server.saveAll(true, true, true);
+        // Stop the engine from writing to the worlds we are about to erase.
+        // This replaces a blocking saveAll(flush = true): flushing parks the server thread
+        // on StorageIoWorker.completeAll() until every queued chunk write reports back, and
+        // that future can stay unfinished forever once the reset has torn entities and block
+        // entity tickers out from under it. On a dedicated server the Watchdog then kills the
+        // process after max-tick-time (60s by default); singleplayer has no Watchdog, which is
+        // why this only ever showed up on real servers. Saving a world moments before deleting
+        // its region files is pointless anyway, and skipping it also stops late writes from
+        // recreating the files the DELETING phase is removing.
+        setSavingDisabled(server, true);
 
         // Advance to the deleting phase after 40 ticks
         // This wait perfectly ensures no dropped items are ticking when we wipe the ram
         advanceTo(ResetPhase.DELETING);
+    }
+
+    private static void setSavingDisabled(MinecraftServer server, boolean disabled) {
+        for (RegistryKey<World> key : WorldUnloader.RESET_DIMENSIONS) {
+            ServerWorld world = server.getWorld(key);
+            if (world != null) {
+                world.savingDisabled = disabled;
+            }
+        }
     }
 
     private static void executeDeletionPhase(MinecraftServer server) {
@@ -283,6 +311,10 @@ public class WorldResetManager {
         advanceTo(ResetPhase.IDLE);
 
         server.execute(() -> {
+            // Deleting and regenerating are done, so the engine may persist worlds again.
+            // This runs first so a failure further down can never leave saving switched off.
+            setSavingDisabled(server, false);
+
             ServerWorld overworld = server.getWorld(World.OVERWORLD);
             if (overworld != null) {
                 // Calculate the new spawn
