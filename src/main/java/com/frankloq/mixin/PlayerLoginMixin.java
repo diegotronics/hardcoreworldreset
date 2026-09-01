@@ -22,7 +22,7 @@ public class PlayerLoginMixin {
         // countdown before it runs left a window where someone could log in, load chunks of
         // a world about to be deleted, and get dragged along into Limbo.
         if (WorldResetManager.isResetting() || com.frankloq.HardcoreWorldReset.isResetImminent()) {
-            cir.setReturnValue(Text.literal("§cThe world is currently resetting.\n§fPlease wait a few seconds and try again."));
+            cir.setReturnValue(Text.literal("§cEl mundo se está reiniciando.\n§fEspera un momento y vuelve a intentarlo."));
         }
     }
 }

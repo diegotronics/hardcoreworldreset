@@ -17,9 +17,17 @@ public class LimboDimension {
             Identifier.of(HardcoreWorldReset.MOD_ID, "limbo")
     );
 
+    // The spot spectators float at when the arena is not used
+    private static final Vec3d DEFAULT_SPOT = new Vec3d(0, 65, 0);
+
     // Teleports the players to the Limbo dimension
     // Returns true if successful, false if the dimension was not found.
     public static boolean teleportToLimbo(ServerPlayerEntity player) {
+        return teleportToLimbo(player, DEFAULT_SPOT, 0.0f);
+    }
+
+    // Same, but to a specific spot (used by the arena to place the culprit and the audience)
+    public static boolean teleportToLimbo(ServerPlayerEntity player, Vec3d pos, float yaw) {
         MinecraftServer server = player.getServer();
 
         if (server == null) {
@@ -47,9 +55,9 @@ public class LimboDimension {
         // We use now 1.21 native teleportation instead of FabricDimensions
         player.teleportTo(new net.minecraft.world.TeleportTarget(
                 limboWorld,
-                new net.minecraft.util.math.Vec3d(0, 65, 0),
+                pos,
                 net.minecraft.util.math.Vec3d.ZERO,
-                0.0f,
+                yaw,
                 0.0f,
                 entity -> {
                     // I kinda liked the sound effect of traveling to the Nether of FabricDimensions so lets add it manually here
