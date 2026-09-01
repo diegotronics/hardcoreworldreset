@@ -35,7 +35,16 @@ public class WorldInjectionUtils {
                     }
                 }
             }
-        } catch (Exception e) {}
+
+            // Falling through means the seed never made it into memory, so the "new" world
+            // would regenerate identically to the old one. Say so instead of failing quietly.
+            com.frankloq.HardcoreWorldReset.LOGGER.error(
+                    "Could not find the seed field for {}. The world may regenerate with the old seed.",
+                    world.getRegistryKey().getValue()
+            );
+        } catch (Exception e) {
+            com.frankloq.HardcoreWorldReset.LOGGER.error("Failed to inject the new seed into memory", e);
+        }
     }
 
     public static void forceCloseRegionFiles(ServerWorld world) {
@@ -57,7 +66,9 @@ public class WorldInjectionUtils {
             }
             if (entityManager != null) deepClose(entityManager, 0, new HashSet<>());
 
-        } catch (Exception e) {}
+        } catch (Exception e) {
+            com.frankloq.HardcoreWorldReset.LOGGER.error("Failed to close the old world's region files", e);
+        }
     }
 
     private static void deepClose(Object target, int depth, Set<Object> visited) {
@@ -116,7 +127,9 @@ public class WorldInjectionUtils {
                     break;
                 }
             }
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            com.frankloq.HardcoreWorldReset.LOGGER.error("Failed to close a region file cache", e);
+        }
     }
 
     public static void clearAllEntities(ServerWorld world) {
@@ -154,7 +167,9 @@ public class WorldInjectionUtils {
                     }
                 }
             }
-        } catch (Exception e) {}
+        } catch (Exception e) {
+            com.frankloq.HardcoreWorldReset.LOGGER.error("Failed to reset the Ender Dragon fight", e);
+        }
     }
 
     // New way of getting rid of the chunks for 1.21 specifically...

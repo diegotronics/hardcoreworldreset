@@ -232,6 +232,12 @@ public class WorldResetManager {
                 deleteFolder(dimPath.resolve("region"));
                 deleteFolder(dimPath.resolve("poi"));
                 deleteFolder(dimPath.resolve("entities"));
+
+                // Saved world state that outlives its terrain: raids keep pointing at villages
+                // that no longer exist, and the random sequences keep the old world's loot rolls.
+                // scoreboard.dat deliberately stays, since it holds the lives objective.
+                deleteFile(dimPath.resolve("data").resolve("raids.dat"));
+                deleteFile(dimPath.resolve("data").resolve("random_sequences.dat"));
             }
 
             HardcoreWorldReset.LOGGER.info("Wiping player data, stats, and advancements...");
@@ -311,90 +317,100 @@ public class WorldResetManager {
         advanceTo(ResetPhase.IDLE);
 
         server.execute(() -> {
-            // Deleting and regenerating are done, so the engine may persist worlds again.
-            // This runs first so a failure further down can never leave saving switched off.
-            setSavingDisabled(server, false);
-
-            ServerWorld overworld = server.getWorld(World.OVERWORLD);
-            if (overworld != null) {
-                // Calculate the new spawn
-                net.minecraft.util.math.BlockPos newSpawn;
-
-                // Protective try-catch block for rapid restarts
-                try {
-                    // We pump the chunk task queue first to clear out ghost tickets from the previous deletion
-                    for (int i = 0; i < 5; i++) {
-                        overworld.getChunkManager().tick(() -> true, true);
-                    }
-
-                    // Attempt the natural spawn
-                    newSpawn = com.frankloq.reset.WorldSpawnLocator.determineWorldSpawn(overworld);
-
-                    overworld.getChunk(newSpawn.getX() >> 4, newSpawn.getZ() >> 4, net.minecraft.world.chunk.ChunkStatus.FULL, true);
-
-                } catch (IllegalStateException e) {
-                    HardcoreWorldReset.LOGGER.warn("Chunk engine overloaded by rapid restarts. Catching crash and falling back to 0,0.");
-
-                    // We safely fallback to 0, 0 because the REGENERATING phase already added a ticket here,
-                    // meaning it is guaranteed to be fully loaded and won't crash
-                    int fallbackY = overworld.getTopY(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, 0, 0);
-                    if (fallbackY <= overworld.getBottomY()) fallbackY = 64; // Anti-void protection
-
-                    newSpawn = new net.minecraft.util.math.BlockPos(0, fallbackY, 0);
-                }
-
-                // Set the actual world spawn to the spawn we just calculated
-                overworld.setSpawnPos(newSpawn, 0.0f);
-
-                // Add ticket to load chunks around 0,0 safely
-                int spawnRadius = server.getGameRules().getInt(net.minecraft.world.GameRules.SPAWN_CHUNK_RADIUS);
-                overworld.getChunkManager().addTicket(
-                        net.minecraft.server.world.ChunkTicketType.START,
-                        new net.minecraft.util.math.ChunkPos(newSpawn),
-                        spawnRadius,
-                        net.minecraft.util.Unit.INSTANCE
-                );
-
-                // Safely teleport players directly to the natural spawn
-                for (net.minecraft.server.network.ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
-                    if (player.getServerWorld().getRegistryKey() == com.frankloq.LimboDimension.LIMBO_KEY) {
-
-                        // Force wipe their RAM cache
-                        com.frankloq.reset.WorldInjectionUtils.wipePlayerState(player);
-
-                        // Teleport the player
-                        player.teleport(
-                                overworld,
-                                newSpawn.getX() + 0.5,
-                                newSpawn.getY() + 1.0,
-                                newSpawn.getZ() + 0.5,
-                                0.0f,
-                                0.0f
-                        );
-                    }
-                }
+            try {
+                finishReset(server);
+            } catch (Exception e) {
+                HardcoreWorldReset.LOGGER.error("World reset failed while finishing up.", e);
+            } finally {
+                // Always hand the lock back. If this block throws on the way out, holding it
+                // would leave the mod permanently unable to start another reset.
+                countdownLocked = false;
             }
-
-            // I'm trying to optimize ram usage but idk if it's gonna do something
-            for (RegistryKey<World> key : WorldUnloader.RESET_DIMENSIONS) {
-                if (key.equals(World.OVERWORLD)) continue;
-
-                ServerWorld world = server.getWorld(key);
-                if (world != null) {
-                    ServerChunkManager manager = world.getChunkManager();
-                    for (int i = 0; i < 50; i++) {
-                        manager.tick(() -> false, true);
-                    }
-                }
-            }
-
-            System.gc();
-
-            server.getPlayerManager().broadcast(Text.literal("§a[Reset] §7World reset complete! Respawning players..."), false);
-            HardcoreWorldReset.onResetComplete(server);
-
-            countdownLocked = false;
         });
+    }
+
+    private static void finishReset(MinecraftServer server) {
+        // Deleting and regenerating are done, so the engine may persist worlds again.
+        // This runs first so a failure further down can never leave saving switched off.
+        setSavingDisabled(server, false);
+
+        ServerWorld overworld = server.getWorld(World.OVERWORLD);
+        if (overworld != null) {
+            // Calculate the new spawn
+            net.minecraft.util.math.BlockPos newSpawn;
+
+            // Protective try-catch block for rapid restarts
+            try {
+                // We pump the chunk task queue first to clear out ghost tickets from the previous deletion
+                for (int i = 0; i < 5; i++) {
+                    overworld.getChunkManager().tick(() -> true, true);
+                }
+
+                // Attempt the natural spawn
+                newSpawn = com.frankloq.reset.WorldSpawnLocator.determineWorldSpawn(overworld);
+
+                overworld.getChunk(newSpawn.getX() >> 4, newSpawn.getZ() >> 4, net.minecraft.world.chunk.ChunkStatus.FULL, true);
+
+            } catch (IllegalStateException e) {
+                HardcoreWorldReset.LOGGER.warn("Chunk engine overloaded by rapid restarts. Catching crash and falling back to 0,0.");
+
+                // We safely fallback to 0, 0 because the REGENERATING phase already added a ticket here,
+                // meaning it is guaranteed to be fully loaded and won't crash
+                int fallbackY = overworld.getTopY(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, 0, 0);
+                if (fallbackY <= overworld.getBottomY()) fallbackY = 64; // Anti-void protection
+
+                newSpawn = new net.minecraft.util.math.BlockPos(0, fallbackY, 0);
+            }
+
+            // Set the actual world spawn to the spawn we just calculated
+            overworld.setSpawnPos(newSpawn, 0.0f);
+
+            // Add ticket to load chunks around 0,0 safely
+            int spawnRadius = server.getGameRules().getInt(net.minecraft.world.GameRules.SPAWN_CHUNK_RADIUS);
+            overworld.getChunkManager().addTicket(
+                    net.minecraft.server.world.ChunkTicketType.START,
+                    new net.minecraft.util.math.ChunkPos(newSpawn),
+                    spawnRadius,
+                    net.minecraft.util.Unit.INSTANCE
+            );
+
+            // Safely teleport players directly to the natural spawn
+            for (net.minecraft.server.network.ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
+                if (player.getServerWorld().getRegistryKey() == com.frankloq.LimboDimension.LIMBO_KEY) {
+
+                    // Force wipe their RAM cache
+                    com.frankloq.reset.WorldInjectionUtils.wipePlayerState(player);
+
+                    // Teleport the player
+                    player.teleport(
+                            overworld,
+                            newSpawn.getX() + 0.5,
+                            newSpawn.getY() + 1.0,
+                            newSpawn.getZ() + 0.5,
+                            0.0f,
+                            0.0f
+                    );
+                }
+            }
+        }
+
+        // I'm trying to optimize ram usage but idk if it's gonna do something
+        for (RegistryKey<World> key : WorldUnloader.RESET_DIMENSIONS) {
+            if (key.equals(World.OVERWORLD)) continue;
+
+            ServerWorld world = server.getWorld(key);
+            if (world != null) {
+                ServerChunkManager manager = world.getChunkManager();
+                for (int i = 0; i < 50; i++) {
+                    manager.tick(() -> false, true);
+                }
+            }
+        }
+
+        System.gc();
+
+        server.getPlayerManager().broadcast(Text.literal("§a[Reset] §7World reset complete! Respawning players..."), false);
+        HardcoreWorldReset.onResetComplete(server);
     }
 
     private static <T> void injectByType(Object target, Class<T> fieldType, T value) {
@@ -436,9 +452,14 @@ public class WorldResetManager {
                 data.put("WorldGenSettings", wgs);
             }
 
-            data.putLong("Time", 0L);
-            data.putLong("DayTime", 0L);
-            if (data.contains("DragonFight")) data.remove("DragonFight");
+            // Only a real reset starts the world over. On shutdown this method runs purely to
+            // make sure the new seed survives, and zeroing these there would rewind the clock
+            // to day one and clear the dragon fight on every single restart after a reset.
+            if (!isShutdown) {
+                data.putLong("Time", 0L);
+                data.putLong("DayTime", 0L);
+                if (data.contains("DragonFight")) data.remove("DragonFight");
+            }
 
             root.put("Data", data);
             Files.copy(levelDatPath, rootPath.resolve("level.dat_old"), StandardCopyOption.REPLACE_EXISTING);
@@ -454,6 +475,14 @@ public class WorldResetManager {
             return server.getSavePath(WorldSavePath.ROOT).normalize();
         } catch (Exception e) {
             return null;
+        }
+    }
+
+    private static void deleteFile(Path path) {
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException e) {
+            HardcoreWorldReset.LOGGER.warn("Could not delete {}: {}", path.getFileName(), e.getMessage());
         }
     }
 

@@ -62,7 +62,11 @@ public class WorldSpawnLocator {
                 int checkX = chunkStartX + dx;
                 int checkZ = chunkStartZ + dz;
 
-        int y = world.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, x, z);
+                // The height has to come from the column being tested. Reading it at the
+                // chunk's own x/z gave all sixteen candidates one shared height, so on any
+                // sloped ground every one of them sat buried or floating and got rejected,
+                // which is what kept pushing spawn selection into its 0,0 fallback.
+                int y = world.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, checkX, checkZ);
 
                 // Anti-void protection
                 if (y <= world.getBottomY()) {
