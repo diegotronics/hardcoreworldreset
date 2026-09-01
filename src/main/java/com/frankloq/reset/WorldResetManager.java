@@ -130,11 +130,16 @@ public class WorldResetManager {
         if (!hasLoadedTryCount) loadTryCount(server);
 
         HardcoreWorldReset.LOGGER.info("Starting true world reset. New seed: {}", newSeed);
-        server.getPlayerManager().broadcast(Text.literal("§5[Reset] §7Beginning world erasure..."), false);
+        server.getPlayerManager().broadcast(Text.literal("§5[Reset] §7Comenzando el borrado del mundo..."), false);
 
-        // Teleport everyone to Limbo before the unloading phase starts
+        // Everyone is already in Limbo (in the arena or floating as a spectator). This only
+        // catches a straggler, because moving arena players again would pull the culprit out
+        // of the pit and the audience off the ring.
         for (net.minecraft.server.network.ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
-            com.frankloq.LimboDimension.teleportToLimbo(player);
+            if (player.getServerWorld().getRegistryKey() != com.frankloq.LimboDimension.LIMBO_KEY) {
+                player.changeGameMode(net.minecraft.world.GameMode.SPECTATOR);
+                com.frankloq.LimboDimension.teleportToLimbo(player);
+            }
         }
 
         advanceTo(ResetPhase.UNLOADING);
@@ -143,7 +148,7 @@ public class WorldResetManager {
     // Had to do all of this as well for 1.21 compatibility
     private static void executeUnloadPhase(MinecraftServer server) {
         HardcoreWorldReset.LOGGER.info("Phase: UNLOADING");
-        server.getPlayerManager().broadcast(Text.literal("§5[Reset] §7Unloading memory cache..."), false);
+        server.getPlayerManager().broadcast(Text.literal("§5[Reset] §7Descargando la caché de memoria..."), false);
 
         // Get rid of entities
         for (RegistryKey<World> key : WorldUnloader.RESET_DIMENSIONS) {
@@ -203,7 +208,7 @@ public class WorldResetManager {
 
     private static void executeDeletionPhase(MinecraftServer server) {
         HardcoreWorldReset.LOGGER.info("Phase: DELETING");
-        server.getPlayerManager().broadcast(Text.literal("§5[Reset] §7Erasing old world files..."), false);
+        server.getPlayerManager().broadcast(Text.literal("§5[Reset] §7Borrando los archivos del mundo anterior..."), false);
 
         for (RegistryKey<World> key : WorldUnloader.RESET_DIMENSIONS) {
             ServerWorld world = server.getWorld(key);
@@ -263,7 +268,7 @@ public class WorldResetManager {
         // Physically save the new try count to the text file
         incrementAndSaveTryCount(server);
 
-        server.getPlayerManager().broadcast(Text.literal("§5[Reset] §7Applying new seed: §e" + newSeed), false);
+        server.getPlayerManager().broadcast(Text.literal("§5[Reset] §7Aplicando la nueva semilla: §e" + newSeed), false);
         writeNewSeedToLevelDat(server, newSeed, false);
 
         for (RegistryKey<World> key : WorldUnloader.RESET_DIMENSIONS) {
@@ -317,19 +322,32 @@ public class WorldResetManager {
         advanceTo(ResetPhase.IDLE);
 
         server.execute(() -> {
+            // While the Limbo arena is running, the players stay there and the arena hands the
+            // new world over when it ends. The lock is then released by exitLimbo() instead.
+            boolean deferredToArena = false;
             try {
-                finishReset(server);
+                deferredToArena = finishReset(server);
             } catch (Exception e) {
                 HardcoreWorldReset.LOGGER.error("World reset failed while finishing up.", e);
+                if (com.frankloq.arena.LimboArena.isRunning()) {
+                    // Let the arena wrap up normally; the exit falls back to whatever spawn is set
+                    com.frankloq.arena.LimboArena.onWorldReady(server);
+                    deferredToArena = true;
+                }
             } finally {
                 // Always hand the lock back. If this block throws on the way out, holding it
                 // would leave the mod permanently unable to start another reset.
-                countdownLocked = false;
+                if (!deferredToArena) {
+                    countdownLocked = false;
+                }
             }
         });
     }
 
-    private static void finishReset(MinecraftServer server) {
+    // Returns true when the players were left in the Limbo arena, which will call exitLimbo()
+    // itself once its minimum time has passed. Returns false when everyone was sent to the new
+    // world right away.
+    private static boolean finishReset(MinecraftServer server) {
         // Deleting and regenerating are done, so the engine may persist worlds again.
         // This runs first so a failure further down can never leave saving switched off.
         setSavingDisabled(server, false);
@@ -373,25 +391,6 @@ public class WorldResetManager {
                     spawnRadius,
                     net.minecraft.util.Unit.INSTANCE
             );
-
-            // Safely teleport players directly to the natural spawn
-            for (net.minecraft.server.network.ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
-                if (player.getServerWorld().getRegistryKey() == com.frankloq.LimboDimension.LIMBO_KEY) {
-
-                    // Force wipe their RAM cache
-                    com.frankloq.reset.WorldInjectionUtils.wipePlayerState(player);
-
-                    // Teleport the player
-                    player.teleport(
-                            overworld,
-                            newSpawn.getX() + 0.5,
-                            newSpawn.getY() + 1.0,
-                            newSpawn.getZ() + 0.5,
-                            0.0f,
-                            0.0f
-                    );
-                }
-            }
         }
 
         // I'm trying to optimize ram usage but idk if it's gonna do something
@@ -409,8 +408,48 @@ public class WorldResetManager {
 
         System.gc();
 
-        server.getPlayerManager().broadcast(Text.literal("§a[Reset] §7World reset complete! Respawning players..."), false);
-        HardcoreWorldReset.onResetComplete(server);
+        if (com.frankloq.arena.LimboArena.isRunning()) {
+            // The punishment goes on until its minimum time is up; the arena then calls exitLimbo()
+            com.frankloq.arena.LimboArena.onWorldReady(server);
+            return true;
+        }
+
+        exitLimbo(server);
+        return false;
+    }
+
+    // Moves everyone out of Limbo into the freshly generated world and finishes the reset.
+    // Called straight from finishReset() when there is no arena, or by the arena when it ends.
+    public static void exitLimbo(MinecraftServer server) {
+        try {
+            ServerWorld overworld = server.getWorld(World.OVERWORLD);
+            if (overworld != null) {
+                net.minecraft.util.math.BlockPos spawn = overworld.getSpawnPos();
+
+                for (net.minecraft.server.network.ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
+                    if (player.getServerWorld().getRegistryKey() == com.frankloq.LimboDimension.LIMBO_KEY) {
+
+                        // Force wipe their RAM cache
+                        com.frankloq.reset.WorldInjectionUtils.wipePlayerState(player);
+
+                        // Teleport the player
+                        player.teleport(
+                                overworld,
+                                spawn.getX() + 0.5,
+                                spawn.getY() + 1.0,
+                                spawn.getZ() + 0.5,
+                                0.0f,
+                                0.0f
+                        );
+                    }
+                }
+            }
+
+            server.getPlayerManager().broadcast(Text.literal("§a[Reset] §7¡Reset del mundo completado! Reapareciendo jugadores..."), false);
+            HardcoreWorldReset.onResetComplete(server);
+        } finally {
+            countdownLocked = false;
+        }
     }
 
     private static <T> void injectByType(Object target, Class<T> fieldType, T value) {

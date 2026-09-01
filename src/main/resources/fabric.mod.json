@@ -3,7 +3,7 @@
 	"id": "hardcoreworldreset",
 	"version": "${version}",
 	"name": "HardcoreWorldReset",
-	"description": "Every player gets a configurable number of lives (3 by default). When someone loses their last one, the world is erased and a new one is created.",
+	"description": "Cada jugador tiene un número configurable de vidas (3 por defecto). Cuando alguien pierde la última, el mundo se borra y se crea uno nuevo, y mientras tanto el culpable es linchado a bolas de nieve en el Limbo.",
 	"authors": ["FrankLoq"],
 	"license": "CC0-1.0",
 	"environment": "*",
@@ -15,6 +15,7 @@
 	"mixins": [
 		"hardcoreworldreset.mixins.json"
 	],
+	"accessWidener": "hardcoreworldreset.accesswidener",
 	"depends": {
 		"fabricloader": ">=0.14.21",
 		"minecraft": [

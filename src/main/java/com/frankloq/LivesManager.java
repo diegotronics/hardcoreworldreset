@@ -24,6 +24,7 @@ import java.util.UUID;
 public class LivesManager {
 
     private static final String OBJECTIVE_NAME = "hwr_lives";
+    private static final Text OBJECTIVE_TITLE = Text.literal("Vidas");
     private static final String LIVES_FILE = "hardcore_lives.properties";
 
     private static final Map<UUID, Integer> lives = new HashMap<>();
@@ -100,11 +101,14 @@ public class LivesManager {
             objective = scoreboard.addObjective(
                     OBJECTIVE_NAME,
                     ScoreboardCriterion.DUMMY,
-                    Text.literal("Lives"),
+                    OBJECTIVE_TITLE,
                     ScoreboardCriterion.RenderType.INTEGER,
                     true,
                     null
             );
+        } else if (!OBJECTIVE_TITLE.equals(objective.getDisplayName())) {
+            // Worlds created before the texts were translated still carry the old title
+            objective.setDisplayName(OBJECTIVE_TITLE);
         }
 
         scoreboard.setObjectiveSlot(ScoreboardDisplaySlot.LIST, objective);
