@@ -70,6 +70,12 @@ public class HardcoreWorldReset implements ModInitializer {
 			WorldResetManager.unlockCountdown();
 		}
 
+		// Take the jumpscare back down with the countdown: red screen, pumpkin overlay and
+		// song all have to go, otherwise an aborted reset leaves everyone staring at it.
+		if (server != null) {
+			ScareEffects.cancel(server);
+		}
+
 		return stopped;
 	}
 
@@ -265,6 +271,26 @@ public class HardcoreWorldReset implements ModInitializer {
 										);
 										return 1;
 									})))
+
+					// 10. testScare (Fires the final-death jumpscare + song without touching the world)
+					.then(literal("testScare")
+							.requires(source -> source.hasPermissionLevel(2))
+							.executes(context -> {
+								ServerPlayerEntity player = context.getSource().getPlayerOrThrow();
+								ScareEffects.startFinalScare(context.getSource().getServer(), player);
+								context.getSource().sendFeedback(
+										() -> Text.literal("§e[Reset] §7Jumpscare preview fired. §7Use §e/hwr stopScare §7to cut it short."), false);
+								return 1;
+							}))
+
+					// 11. stopScare (Clears the scare and stops the song)
+					.then(literal("stopScare")
+							.requires(source -> source.hasPermissionLevel(2))
+							.executes(context -> {
+								ScareEffects.cancel(context.getSource().getServer());
+								context.getSource().sendFeedback(() -> Text.literal("§a[Reset] §7Scare cleared."), false);
+								return 1;
+							}))
 			);
 		});
 
@@ -387,6 +413,9 @@ public class HardcoreWorldReset implements ModInitializer {
 			}
 		}
 
+		// Advance the jumpscare timeline (it starts the song once the scream has landed)
+		ScareEffects.tick(server);
+
 		// Advance the world reset pipeline if it is running
 		WorldResetManager.tick(server);
 
@@ -448,6 +477,7 @@ public class HardcoreWorldReset implements ModInitializer {
 					? "§c" + player.getName().getString() + " §7is down to their §cLAST §7life!"
 					: "§7" + player.getName().getString() + " §7lost a life! §c" + remaining + " §7remaining.";
 			server.getPlayerManager().broadcast(Text.literal(warning), false);
+			ScareEffects.playDeathSound(server);
 
 			return false;
 		}
@@ -465,6 +495,10 @@ public class HardcoreWorldReset implements ModInitializer {
 					Text.literal("§c" + player.getName().getString() + " §7lost their §cfinal §7life!"),
 					false
 			);
+
+			// Jumpscare first; ScareEffects.tick() drops the song in a couple of seconds later,
+			// well before the five second countdown drags everyone into Limbo.
+			ScareEffects.startFinalScare(server, player);
 
 			resetInProgress = true;
 			limboCountdownTicks = 5 * 20;
@@ -541,6 +575,7 @@ public class HardcoreWorldReset implements ModInitializer {
 			);
 			resetInProgress = false;
 			limboCountdownTicks = -1;
+			ScareEffects.cancel(server);
 
 			// Release the countdown lock. tryLockCountdown() took it when this attempt
 			// started, and leaving it held makes every later reset fail silently for the
@@ -638,15 +673,38 @@ public class HardcoreWorldReset implements ModInitializer {
 						LOGGER.warn("Invalid max-lives value in config, falling back to 3.");
 					}
 
+					ScareEffects.deathSound = props.getProperty("death-sound", ScareEffects.deathSound);
+					ScareEffects.finalDeathSound = props.getProperty("final-death-sound", ScareEffects.finalDeathSound);
+					ScareEffects.finalDeathSong = props.getProperty("final-death-song", ScareEffects.finalDeathSong);
+					ScareEffects.scareScreen = Boolean.parseBoolean(
+							props.getProperty("scare-screen-effects", String.valueOf(ScareEffects.scareScreen)));
+
+					try {
+						ScareEffects.deathSoundPitch = Float.parseFloat(props.getProperty("death-sound-pitch", String.valueOf(ScareEffects.deathSoundPitch)).trim());
+					} catch (NumberFormatException e) {
+						LOGGER.warn("Invalid death-sound-pitch value in config, falling back to 0.7.");
+					}
+
+					try {
+						ScareEffects.songDelayTicks = Math.max(0,
+								Integer.parseInt(props.getProperty("final-song-delay-ticks", String.valueOf(ScareEffects.songDelayTicks)).trim()));
+					} catch (NumberFormatException e) {
+						LOGGER.warn("Invalid final-song-delay-ticks value in config, falling back to 40.");
+					}
+
 					LOGGER.info("Loaded config: reuse-same-seed = " + reuseSeed
 							+ ", always-show-action-bar = " + alwaysShowActionBar
-							+ ", max-lives = " + maxLives);
+							+ ", max-lives = " + maxLives
+							+ ", death-sound = " + ScareEffects.deathSound
+							+ ", final-death-sound = " + ScareEffects.finalDeathSound
+							+ ", final-death-song = " + ScareEffects.finalDeathSong);
 				}
 			} else {
 				// If it doesn't exist, create it with the defaults
 				props.setProperty("reuse-same-seed", "false");
 				props.setProperty("always-show-action-bar", "false");
 				props.setProperty("max-lives", "3");
+				writeScareDefaults(props);
 				try (java.io.OutputStream out = java.nio.file.Files.newOutputStream(configFile)) {
 					props.store(out, "Hardcore World Reset Configuration");
 					LOGGER.info("Generated default config file.");
@@ -666,6 +724,7 @@ public class HardcoreWorldReset implements ModInitializer {
 			props.setProperty("reuse-same-seed", String.valueOf(reuseSeed));
 			props.setProperty("always-show-action-bar", String.valueOf(alwaysShowActionBar));
 			props.setProperty("max-lives", String.valueOf(maxLives));
+			writeScareDefaults(props);
 
 			try (java.io.OutputStream out = java.nio.file.Files.newOutputStream(configFile)) {
 				props.store(out, "Hardcore World Reset Configuration");
@@ -674,5 +733,16 @@ public class HardcoreWorldReset implements ModInitializer {
 		} catch (Exception e) {
 			LOGGER.error("Failed to save config file!", e);
 		}
+	}
+
+	// Sound ids may be any minecraft:* event, or a custom one shipped in the server resource
+	// pack (see resourcepack/README.md). Leave a value empty, or set it to "none", to mute it.
+	private static void writeScareDefaults(java.util.Properties props) {
+		props.setProperty("death-sound", ScareEffects.deathSound);
+		props.setProperty("death-sound-pitch", String.valueOf(ScareEffects.deathSoundPitch));
+		props.setProperty("final-death-sound", ScareEffects.finalDeathSound);
+		props.setProperty("final-death-song", ScareEffects.finalDeathSong);
+		props.setProperty("final-song-delay-ticks", String.valueOf(ScareEffects.songDelayTicks));
+		props.setProperty("scare-screen-effects", String.valueOf(ScareEffects.scareScreen));
 	}
 }

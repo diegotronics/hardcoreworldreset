@@ -1,0 +1,11 @@
+{
+	"final_song": {
+		"category": "master",
+		"sounds": [
+			{
+				"name": "hardcoreworldreset:final_song",
+				"stream": true
+			}
+		]
+	}
+}
