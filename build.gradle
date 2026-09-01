@@ -47,6 +47,28 @@ jar {
 	}
 }
 
+// The same sounds that ship inside the jar, packaged as a server resource pack so clients
+// that do not have the mod installed hear them too (see resourcepack/README.md).
+tasks.register('resourcePack', Zip) {
+	group = 'build'
+	description = 'Packs the custom sounds as a resource pack for clients without the mod'
+	archiveFileName = "hardcoreworldreset-resourcepack-${project.version}.zip"
+	destinationDirectory = layout.buildDirectory.dir('libs')
+	from('resourcepack') {
+		exclude 'README.md'
+	}
+	from('src/main/resources/assets') {
+		into 'assets'
+	}
+	from('src/main/resources/assets/hardcoreworldreset/icon.png') {
+		rename { 'pack.png' }
+	}
+}
+
+tasks.named('build') {
+	dependsOn 'resourcePack'
+}
+
 publishing {
 	publications {
 		create("mavenJava", MavenPublication) {

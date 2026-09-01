@@ -11,6 +11,7 @@ import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+import net.minecraft.command.CommandSource;
 import net.minecraft.command.argument.EntityArgumentType;
 import net.minecraft.entity.damage.DamageSource;
 import net.minecraft.network.packet.s2c.play.GameStateChangeS2CPacket;
@@ -29,6 +30,8 @@ import static com.mojang.brigadier.arguments.BoolArgumentType.bool;
 import static com.mojang.brigadier.arguments.BoolArgumentType.getBool;
 import static com.mojang.brigadier.arguments.IntegerArgumentType.getInteger;
 import static com.mojang.brigadier.arguments.IntegerArgumentType.integer;
+import static com.mojang.brigadier.arguments.StringArgumentType.getString;
+import static com.mojang.brigadier.arguments.StringArgumentType.word;
 import static net.minecraft.server.command.CommandManager.argument;
 import static net.minecraft.server.command.CommandManager.literal;
 
@@ -117,7 +120,10 @@ public class HardcoreWorldReset implements ModInitializer {
 		ServerLivingEntityEvents.ALLOW_DAMAGE.register(LimboArena::allowDamage);
 		ServerLivingEntityEvents.ALLOW_DEATH.register(LimboArena::allowDeath);
 
-		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> LimboArena.onPlayerDisconnect(handler.player));
+		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
+			LimboArena.onPlayerDisconnect(handler.player);
+			ModSounds.onDisconnect(handler.player);
+		});
 
 		// After a non-final death the player respawns through the vanilla flow;
 		// greet them with how many lives they have left.
@@ -328,7 +334,48 @@ public class HardcoreWorldReset implements ModInitializer {
 												return 1;
 											}))))
 
-					// 11. culpables (The hall of shame; no OP required)
+					// 11. sounds (Switch the mod's sound effects, preview them, silence them)
+					.then(literal("sounds")
+							.then(literal("enabled")
+									.requires(source -> source.hasPermissionLevel(2))
+									.then(argument("valor", bool())
+											.executes(context -> {
+												ModSounds.enabled = getBool(context, "valor");
+												saveConfig();
+												if (!ModSounds.enabled) {
+													ModSounds.stopAll(context.getSource().getServer());
+												}
+												context.getSource().getServer().getPlayerManager().broadcast(
+														Text.literal("§a[Sonidos] §7sounds-enabled establecido en: §e" + ModSounds.enabled), false
+												);
+												return 1;
+											})))
+							.then(literal("test")
+									.requires(source -> source.hasPermissionLevel(2))
+									.then(argument("sonido", word())
+											.suggests((context, builder) -> CommandSource.suggestMatching(ModSounds.NAMES, builder))
+											.executes(context -> {
+												String name = getString(context, "sonido");
+												net.minecraft.sound.SoundEvent sound = ModSounds.byName(name);
+												if (sound == null) {
+													context.getSource().sendError(Text.literal("§c[Sonidos] §7Sonido desconocido. Opciones: §e" + String.join(", ", ModSounds.NAMES)));
+													return 0;
+												}
+												for (ServerPlayerEntity p : context.getSource().getServer().getPlayerManager().getPlayerList()) {
+													ModSounds.play(p, sound);
+												}
+												context.getSource().sendFeedback(() -> Text.literal("§e[Sonidos] §7Reproduciendo §f" + name + " §7para todos. §7Usa §e/hwr sounds stop §7para cortarlo."), true);
+												return 1;
+											})))
+							.then(literal("stop")
+									.requires(source -> source.hasPermissionLevel(2))
+									.executes(context -> {
+										ModSounds.stopAll(context.getSource().getServer());
+										context.getSource().sendFeedback(() -> Text.literal("§a[Sonidos] §7Sonidos detenidos."), true);
+										return 1;
+									})))
+
+					// 12. culpables (The hall of shame; no OP required)
 					.then(literal("culpables")
 							.executes(context -> {
 								java.util.List<HallOfShame.Entry> entries = HallOfShame.load(context.getSource().getServer(), 10);
@@ -471,6 +518,9 @@ public class HardcoreWorldReset implements ModInitializer {
 			}
 		}
 
+		// Background track for whoever is in the Limbo, stopped the moment they leave it
+		ModSounds.tick(server);
+
 		// The Limbo arena runs alongside the reset pipeline and hands the new world over itself
 		LimboArena.tick(server);
 
@@ -542,6 +592,7 @@ public class HardcoreWorldReset implements ModInitializer {
 					? "§7¡§c" + player.getName().getString() + " §7está en su §cÚLTIMA §7vida!"
 					: "§7¡" + player.getName().getString() + " perdió una vida! Le quedan §c" + remaining + "§7.";
 			server.getPlayerManager().broadcast(Text.literal(warning), false);
+			ModSounds.playToAll(server, ModSounds.DEAD);
 
 			return false;
 		}
@@ -558,6 +609,9 @@ public class HardcoreWorldReset implements ModInitializer {
 			// Remember who to blame: the arena needs the name, the skin and the cause of death
 			pendingCulprit = player.getGameProfile();
 			pendingDeathCause = deathMessage;
+
+			// The scream lands with the death message, and fades right before the Limbo trip
+			ModSounds.playToAll(server, ModSounds.JUMPSCARE);
 
 			server.getPlayerManager().broadcast(
 					Text.literal("§7¡§c" + player.getName().getString() + " §7perdió su §cúltima §7vida!"),
@@ -749,6 +803,7 @@ public class HardcoreWorldReset implements ModInitializer {
 
 		// Respawn all players into the fresh world
 		PlayerRespawner.respawnAllPlayers(server);
+		ModSounds.playToAll(server, ModSounds.RESET_WORLD);
 
 		// Fresh world, fresh lives for everyone
 		LivesManager.resetAllLives(server);
@@ -796,6 +851,7 @@ public class HardcoreWorldReset implements ModInitializer {
 					String showBar = props.getProperty("always-show-action-bar", "false");
 					alwaysShowActionBar = Boolean.parseBoolean(showBar);
 					arenaEnabled = Boolean.parseBoolean(props.getProperty("arena-enabled", "true"));
+					ModSounds.enabled = Boolean.parseBoolean(props.getProperty("sounds-enabled", "true"));
 
 					try {
 						maxLives = Math.max(1, Integer.parseInt(props.getProperty("max-lives", "3").trim()));
@@ -815,11 +871,13 @@ public class HardcoreWorldReset implements ModInitializer {
 							+ ", always-show-action-bar = " + alwaysShowActionBar
 							+ ", max-lives = " + maxLives
 							+ ", arena-enabled = " + arenaEnabled
-							+ ", arena-min-seconds = " + arenaMinSeconds);
+							+ ", arena-min-seconds = " + arenaMinSeconds
+							+ ", sounds-enabled = " + ModSounds.enabled);
 				}
 
-				// Older config files predate the arena keys: write them out so they can be edited
-				if (!props.containsKey("arena-enabled") || !props.containsKey("arena-min-seconds")) {
+				// Older config files predate some keys: write them out so they can be edited
+				if (!props.containsKey("arena-enabled") || !props.containsKey("arena-min-seconds")
+						|| !props.containsKey("sounds-enabled")) {
 					saveConfig();
 				}
 			} else {
@@ -829,6 +887,7 @@ public class HardcoreWorldReset implements ModInitializer {
 				props.setProperty("max-lives", "3");
 				props.setProperty("arena-enabled", "true");
 				props.setProperty("arena-min-seconds", "30");
+				props.setProperty("sounds-enabled", "true");
 				try (java.io.OutputStream out = java.nio.file.Files.newOutputStream(configFile)) {
 					props.store(out, "Hardcore World Reset Configuration");
 					LOGGER.info("Generated default config file.");
@@ -850,6 +909,7 @@ public class HardcoreWorldReset implements ModInitializer {
 			props.setProperty("max-lives", String.valueOf(maxLives));
 			props.setProperty("arena-enabled", String.valueOf(arenaEnabled));
 			props.setProperty("arena-min-seconds", String.valueOf(arenaMinSeconds));
+			props.setProperty("sounds-enabled", String.valueOf(ModSounds.enabled));
 
 			try (java.io.OutputStream out = java.nio.file.Files.newOutputStream(configFile)) {
 				props.store(out, "Hardcore World Reset Configuration");
@@ -857,7 +917,8 @@ public class HardcoreWorldReset implements ModInitializer {
 						+ ", always-show-action-bar = " + alwaysShowActionBar
 						+ ", max-lives = " + maxLives
 						+ ", arena-enabled = " + arenaEnabled
-						+ ", arena-min-seconds = " + arenaMinSeconds);
+						+ ", arena-min-seconds = " + arenaMinSeconds
+						+ ", sounds-enabled = " + ModSounds.enabled);
 			}
 		} catch (Exception e) {
 			LOGGER.error("Failed to save config file!", e);
