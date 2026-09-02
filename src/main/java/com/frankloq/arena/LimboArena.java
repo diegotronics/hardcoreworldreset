@@ -2,6 +2,7 @@ package com.frankloq.arena;
 
 import com.frankloq.HardcoreWorldReset;
 import com.frankloq.LimboDimension;
+import com.frankloq.ModSounds;
 import com.frankloq.reset.WorldResetManager;
 import com.mojang.authlib.GameProfile;
 import net.minecraft.entity.Entity;
@@ -199,6 +200,7 @@ public final class LimboArena {
 
             prepare(player);
             LimboDimension.teleportToLimbo(player, spot, ArenaBuilder.yawTowards(spot, ArenaBuilder.PIT_CENTER));
+            ModSounds.startLimboTrack(server, player);
 
             if (isCulprit) {
                 player.addStatusEffect(new StatusEffectInstance(StatusEffects.GLOWING, StatusEffectInstance.INFINITE, 0, false, false, false));
@@ -580,6 +582,7 @@ public final class LimboArena {
 
         if (wasTest) {
             for (ServerPlayerEntity player : online) {
+                ModSounds.stopLimboTrack(player);
                 PlayerSnapshot snapshot = snapshots.remove(player.getUuid());
                 if (snapshot != null) {
                     snapshot.restore(player);
@@ -639,7 +642,10 @@ public final class LimboArena {
 
     private static void playIntro(MinecraftServer server) {
         for (ServerPlayerEntity player : onlineParticipants(server)) {
-            player.playSoundToPlayer(SoundEvents.ENTITY_WITHER_SPAWN, SoundCategory.MASTER, 0.7f, 0.8f);
+            // The custom Limbo track is the arena's soundscape; the roar is the fallback without it
+            if (!ModSounds.enabled) {
+                player.playSoundToPlayer(SoundEvents.ENTITY_WITHER_SPAWN, SoundCategory.MASTER, 0.7f, 0.8f);
+            }
             if (culprit == null) {
                 sendTitle(player, "§6SE ACABÓ EL TIEMPO", "§7Nadie tiene la culpa esta vez", 10, 70, 20);
             } else if (isCulprit(player)) {

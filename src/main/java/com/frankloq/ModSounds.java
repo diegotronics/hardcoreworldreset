@@ -101,6 +101,22 @@ public final class ModSounds {
         }
     }
 
+    // The arena starts the track itself the moment a player lands in it; tick() then keeps it
+    // looping and stops it when they leave.
+    public static void startLimboTrack(MinecraftServer server, ServerPlayerEntity player) {
+        if (!enabled) return;
+        player.networkHandler.sendPacket(new StopSoundS2CPacket(VANILLA_END_MUSIC, SoundCategory.MUSIC));
+        play(player, LIMBO);
+        limboTrack.put(player.getUuid(), server.getTicks() + LIMBO_LOOP_TICKS);
+    }
+
+    // Cuts the track right away, before whatever comes next (the reset stinger, a restore)
+    public static void stopLimboTrack(ServerPlayerEntity player) {
+        if (limboTrack.remove(player.getUuid()) != null) {
+            stop(player, LIMBO);
+        }
+    }
+
     // Keeps the Limbo track playing for whoever is in the Limbo dimension and stops it the
     // moment they leave, whether through the reset, an arena test or the login rescue.
     public static void tick(MinecraftServer server) {
