@@ -429,6 +429,9 @@ public class WorldResetManager {
                 for (net.minecraft.server.network.ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
                     if (player.getServerWorld().getRegistryKey() == com.frankloq.LimboDimension.LIMBO_KEY) {
 
+                        // The Limbo track ends here; the reset stinger plays on arrival
+                        com.frankloq.ModSounds.stopLimboTrack(player);
+
                         // Force wipe their RAM cache
                         com.frankloq.reset.WorldInjectionUtils.wipePlayerState(player);
 

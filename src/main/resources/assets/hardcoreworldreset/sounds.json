@@ -1,0 +1,22 @@
+{
+	"dead": {
+		"sounds": [
+			{ "name": "hardcoreworldreset:dead" }
+		]
+	},
+	"jumpscare": {
+		"sounds": [
+			{ "name": "hardcoreworldreset:jumpscare" }
+		]
+	},
+	"limbo": {
+		"sounds": [
+			{ "name": "hardcoreworldreset:limbo", "stream": true }
+		]
+	},
+	"resetworld": {
+		"sounds": [
+			{ "name": "hardcoreworldreset:resetworld" }
+		]
+	}
+}
