@@ -1,16 +1,28 @@
 package com.frankloq.reset;
 
+import com.frankloq.HardcoreWorldReset;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.registry.entry.RegistryEntry;
+import net.minecraft.registry.tag.BiomeTags;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.Heightmap;
+import net.minecraft.world.biome.Biome;
+import net.minecraft.world.biome.source.BiomeCoords;
 import net.minecraft.world.chunk.ChunkStatus;
+import net.minecraft.world.gen.chunk.ChunkGenerator;
+import net.minecraft.world.gen.chunk.NoiseChunkGenerator;
+import net.minecraft.world.gen.chunk.VerticalBlockSample;
+import net.minecraft.world.gen.noise.NoiseConfig;
 
 public class WorldSpawnLocator {
 
     public static BlockPos determineWorldSpawn(ServerWorld world) {
         BlockPos bestPos = null;
+        int sampled = 0;
+        int generated = 0;
+        long startedAt = System.currentTimeMillis();
 
         for (int r = 0; r <= 384; r += 16) {
 
@@ -22,6 +34,17 @@ public class WorldSpawnLocator {
                 int x = (int) (Math.cos(angle) * r);
                 int z = (int) (Math.sin(angle) * r);
 
+                // Generating a full chunk for every candidate is what used to hold the server
+                // thread for tens of seconds when (0, 0) landed in an ocean: each one costs a
+                // whole pyramid of neighbouring chunks at lower statuses. The noise column
+                // alone tells water from land in a fraction of a millisecond, so only the
+                // candidates that look like dry land get the real chunk.
+                sampled++;
+                if (!looksLikeDryLand(world, x, z)) {
+                    continue;
+                }
+
+                generated++;
                 BlockPos candidate = checkAndGetSafePos(world, x, z);
                 if (candidate != null) {
                     bestPos = candidate;
@@ -30,6 +53,9 @@ public class WorldSpawnLocator {
             }
             if (bestPos != null) break;
         }
+
+        HardcoreWorldReset.LOGGER.info("Spawn search: {} column(s) sampled, {} chunk(s) generated, {} ms, result {}.",
+                sampled, generated, System.currentTimeMillis() - startedAt, bestPos);
 
         // Fallback if the entire 2048 radius is somehow ocean
         if (bestPos == null) {
@@ -46,6 +72,36 @@ public class WorldSpawnLocator {
 
     return bestPos;
 }
+
+    // A cheap look at the terrain noise for one column, without loading or generating a chunk:
+    // true when the first thing under the sky is solid ground rather than water, lava or the
+    // void. Generators without noise (flat, debug) get no cheap answer and always pass.
+    private static boolean looksLikeDryLand(ServerWorld world, int x, int z) {
+        ChunkGenerator generator = world.getChunkManager().getChunkGenerator();
+        if (!(generator instanceof NoiseChunkGenerator)) {
+            return true;
+        }
+
+        NoiseConfig noiseConfig = world.getChunkManager().getNoiseConfig();
+
+        // The biome costs a handful of noise samples and rules out most of the water before
+        // the column, which is a few milliseconds, gets sampled at all
+        RegistryEntry<Biome> biome = generator.getBiomeSource()
+                .getBiome(BiomeCoords.fromBlock(x), BiomeCoords.fromBlock(generator.getSeaLevel()), BiomeCoords.fromBlock(z), noiseConfig.getMultiNoiseSampler());
+        if (biome.isIn(BiomeTags.IS_OCEAN) || biome.isIn(BiomeTags.IS_DEEP_OCEAN) || biome.isIn(BiomeTags.IS_RIVER)) {
+            return false;
+        }
+
+        VerticalBlockSample column = generator.getColumnSample(x, z, world, noiseConfig);
+        for (int y = world.getTopY() - 1; y >= world.getBottomY(); y--) {
+            BlockState state = column.getState(y);
+            if (state.isAir()) {
+                continue;
+            }
+            return state.getFluidState().isEmpty();
+        }
+        return false;
+    }
 
     public static BlockPos checkAndGetSafePos(ServerWorld world, int x, int z) {
         // We load the chunk at the target X, Z to scan it safely

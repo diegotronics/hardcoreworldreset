@@ -7,6 +7,7 @@
 		"PlayerDeathMixin",
 		"PlayerLoginMixin",
 		"RegistryBypassMixin",
+		"RespawnRequestMixin",
 		"SnowballHitMixin"
 	],
 	"client": [],
