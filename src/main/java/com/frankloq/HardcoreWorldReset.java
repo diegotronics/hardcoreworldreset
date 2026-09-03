@@ -54,11 +54,26 @@ public class HardcoreWorldReset implements ModInitializer {
 	private static int actionBarDisplayTicks = 0; // Tracks the 5-second popup
 	private static final java.util.Map<net.minecraft.server.network.ServerPlayerEntity, Integer> rescueQueue = new java.util.HashMap<>();
 
+	// Players whose death the mod intercepted and parked as spectators until the Limbo trip.
+	// Their client may believe they are dead; see managesPlayer().
+	private static final java.util.Set<java.util.UUID> frozenPlayers = new java.util.HashSet<>();
+
 	// Who spent the final life, remembered from the death until the Limbo trip five seconds later
 	private static GameProfile pendingCulprit = null;
 	private static Text pendingDeathCause = null;
 
 	public static boolean isModEnabled() { return modEnabled; }
+
+	// True while the mod owns this player's state: frozen after an intercepted death, inside the
+	// Limbo, or with a reset counting down or running. A respawn request from such a player is
+	// honoured even though they look alive to vanilla (RespawnRequestMixin).
+	public static boolean managesPlayer(ServerPlayerEntity player) {
+		return frozenPlayers.contains(player.getUuid())
+				|| isResetImminent()
+				|| WorldResetManager.isResetting()
+				|| LimboArena.isRunning()
+				|| player.getServerWorld().getRegistryKey() == LimboDimension.LIMBO_KEY;
+	}
 
 	public static boolean cancelCountdown(MinecraftServer server) {
 		boolean stopped = false;
@@ -92,6 +107,7 @@ public class HardcoreWorldReset implements ModInitializer {
 		// The arena keeps the lock on purpose until it hands the new world over.
 		if (!WorldResetManager.isResetting() && !LimboArena.isRunning()) {
 			WorldResetManager.unlockCountdown();
+			frozenPlayers.clear();
 		}
 
 		return stopped;
@@ -128,11 +144,15 @@ public class HardcoreWorldReset implements ModInitializer {
 		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
 			LimboArena.onPlayerDisconnect(handler.player);
 			ModSounds.onDisconnect(handler.player);
+			PlayerRespawner.onDisconnect(handler.player);
 		});
 
 		// After a non-final death the player respawns through the vanilla flow;
 		// greet them with how many lives they have left.
 		net.fabricmc.fabric.api.entity.event.v1.ServerPlayerEvents.AFTER_RESPAWN.register((oldPlayer, newPlayer, alive) -> {
+			// A respawn replaces the player entity; the arena tracks a few things by entity
+			LimboArena.onPlayerRespawned(oldPlayer, newPlayer);
+
 			if (alive) return; // Ignore dimension-change "respawns" (e.g. leaving the End)
 
 			// Safety net for servers running hardcore=true, where vanilla respawns players as spectators
@@ -142,6 +162,10 @@ public class HardcoreWorldReset implements ModInitializer {
 			}
 
 			LivesManager.syncPlayer(newPlayer);
+
+			// A respawn the reset forced on someone still sitting on the death screen is not a
+			// fresh death: the lives were already announced when they died
+			if (isResetImminent() || WorldResetManager.isResetting() || LimboArena.isRunning()) return;
 
 			int remaining = LivesManager.getLives(newPlayer);
 			String hearts = remaining <= 10 ? "§c❤".repeat(Math.max(remaining, 0)) : "§c" + remaining + " ❤";
@@ -667,6 +691,8 @@ public class HardcoreWorldReset implements ModInitializer {
 
 	// Keeps a "dead" player alive and parked in spectator while the reset takes care of the rest
 	private static void freezePlayerForReset(ServerPlayerEntity player) {
+		frozenPlayers.add(player.getUuid());
+
 		// Restore health server-side
 		player.setHealth(20.0f);
 		player.getHungerManager().setFoodLevel(20);
@@ -712,6 +738,11 @@ public class HardcoreWorldReset implements ModInitializer {
 			abortLimboTeleport(server);
 			return;
 		}
+
+		// Whoever died with lives to spare during the countdown and is still on the death
+		// screen has to respawn first: a dead entity cannot be teleported, and reviving it in
+		// place would leave their client stuck on that screen with a useless respawn button
+		PlayerRespawner.ensureAllAlive(server);
 
 		// The arena locks everyone in and takes care of the players until the new world is
 		// ready. When it cannot run (nobody to throw, nobody to throw at) everyone floats in
@@ -832,6 +863,7 @@ public class HardcoreWorldReset implements ModInitializer {
 
 		// Reset the flag so future deaths trigger a new reset
 		resetInProgress = false;
+		frozenPlayers.clear();
 
 		// Respawn all players into the fresh world
 		PlayerRespawner.respawnAllPlayers(server);

@@ -3,6 +3,7 @@ package com.frankloq.arena;
 import com.frankloq.HardcoreWorldReset;
 import com.frankloq.LimboDimension;
 import com.frankloq.ModSounds;
+import com.frankloq.reset.PlayerRespawner;
 import com.frankloq.reset.WorldResetManager;
 import com.mojang.authlib.GameProfile;
 import net.minecraft.entity.Entity;
@@ -150,6 +151,10 @@ public final class LimboArena {
             HardcoreWorldReset.LOGGER.error("Limbo world not found, the arena cannot run.");
             return false;
         }
+
+        // Anyone still sitting on the vanilla death screen respawns first; prepare() would
+        // otherwise revive a dead entity in place and leave their client stuck on that screen
+        PlayerRespawner.ensureAllAlive(server);
 
         List<ServerPlayerEntity> players = new ArrayList<>(server.getPlayerManager().getPlayerList());
         if (players.isEmpty()) return false;
@@ -324,6 +329,14 @@ public final class LimboArena {
                 wallText.setText(buildWallText());
             }
         }
+    }
+
+    // A respawn replaces the player entity (see PlayerRespawner). Everything here is tracked by
+    // UUID except the boss bar, which holds entities and has to follow.
+    public static void onPlayerRespawned(ServerPlayerEntity oldPlayer, ServerPlayerEntity newPlayer) {
+        if (state == State.INACTIVE || bossBar == null || !participants.contains(newPlayer.getUuid())) return;
+        bossBar.removePlayer(oldPlayer);
+        bossBar.addPlayer(newPlayer);
     }
 
     // A player from a test run logging back in: put them back where they were, a second from

@@ -6,15 +6,16 @@ import net.minecraft.nbt.NbtIo;
 import net.minecraft.registry.RegistryKey;
 import net.minecraft.registry.RegistryKeys;
 import net.minecraft.server.MinecraftServer;
-import net.minecraft.server.world.ChunkTicketType;
+import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerChunkManager;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.text.Text;
-import net.minecraft.util.Unit;
 import net.minecraft.util.WorldSavePath;
-import net.minecraft.util.math.ChunkPos;
 import net.minecraft.world.World;
+import net.minecraft.world.gen.chunk.ChunkGenerator;
+import net.minecraft.world.gen.chunk.ChunkGeneratorSettings;
 import net.minecraft.world.gen.chunk.NoiseChunkGenerator;
+import net.minecraft.world.gen.chunk.placement.StructurePlacementCalculator;
 import net.minecraft.world.gen.noise.NoiseConfig;
 
 import java.io.IOException;
@@ -22,18 +23,49 @@ import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.util.Comparator;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Random;
-import java.util.stream.Stream;
+import java.util.concurrent.CompletableFuture;
 
+/**
+ * The erase-and-regenerate pipeline, run one phase per server tick:
+ *
+ * <pre>
+ *  UNLOADING     entities discarded, every chunk ticket handed back to the engine
+ *  DRAINING      the engine unloads the chunks itself; once it is empty the generators are
+ *                switched to the new seed and the io workers drop the writes they still hold,
+ *                close the region files and delete their folders (on their own thread)
+ *  DELETING      whatever is left on disk removed, along with the player data
+ *  REGENERATING  level.dat, try counter, raids, dragon fight and a temporary spawn
+ *  DONE          spawn found in the new world, players handed over (or left to the arena)
+ * </pre>
+ *
+ * Earlier versions skipped the unload and tore the chunk holders and io queues out of the
+ * engine by reflection while it kept running. Whatever was mid-flight then finished after the
+ * files were gone: a queued write recreated a region file with a chunk of the old world, and
+ * the new world came up with slabs of old-seed terrain and sheer walls where they met the new
+ * chunks, worse with every reset. Letting the engine finish first is what makes the deletion
+ * safe, and it also cleans up the tick schedulers, POIs and light data that used to leak.
+ */
 public class WorldResetManager {
 
     private static final int PHASE_DELAY_TICKS = 40;
+    // How long the engine gets to unload every chunk the vanilla way before the leftovers are
+    // dropped, and how long the io workers get to drop their queues. Both are upper bounds:
+    // the phase moves on as soon as the work is done.
+    private static final int MAX_UNLOAD_TICKS = 600;
+    private static final int MAX_IO_TICKS = 200;
 
     private static ResetPhase currentPhase = ResetPhase.IDLE;
     private static int phaseTimer = 0;
     private static long newSeed = 0;
     private static boolean countdownLocked = false;
+
+    // DRAINING bookkeeping
+    private static int drainTicks = 0;
+    private static int ioTicks = 0;
+    private static CompletableFuture<Void> pendingIo = null;
 
     private static int currentTry = 1;
     private static boolean hasLoadedTryCount = false;
@@ -99,6 +131,7 @@ public class WorldResetManager {
 
         switch (currentPhase) {
             case UNLOADING -> executeUnloadPhase(server);
+            case DRAINING -> executeDrainPhase(server);
             case DELETING -> executeDeletionPhase(server);
             case REGENERATING -> executeRegenerationPhase(server);
             case DONE -> executeDonePhase(server);
@@ -135,66 +168,122 @@ public class WorldResetManager {
         // Everyone is already in Limbo (in the arena or floating as a spectator). This only
         // catches a straggler, because moving arena players again would pull the culprit out
         // of the pit and the audience off the ring.
-        for (net.minecraft.server.network.ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
+        for (ServerPlayerEntity player : new ArrayList<>(server.getPlayerManager().getPlayerList())) {
+            // A player still on the vanilla death screen has to respawn before they can move
+            player = PlayerRespawner.ensureAlive(server, player);
             if (player.getServerWorld().getRegistryKey() != com.frankloq.LimboDimension.LIMBO_KEY) {
                 player.changeGameMode(net.minecraft.world.GameMode.SPECTATOR);
                 com.frankloq.LimboDimension.teleportToLimbo(player);
             }
         }
 
-        advanceTo(ResetPhase.UNLOADING);
+        advanceTo(ResetPhase.UNLOADING, PHASE_DELAY_TICKS);
     }
 
-    // Had to do all of this as well for 1.21 compatibility
     private static void executeUnloadPhase(MinecraftServer server) {
         HardcoreWorldReset.LOGGER.info("Phase: UNLOADING");
-        server.getPlayerManager().broadcast(Text.literal("§5[Reset] §7Descargando la caché de memoria..."), false);
+        server.getPlayerManager().broadcast(Text.literal("§5[Reset] §7Descargando el mundo anterior..."), false);
 
-        // Get rid of entities
         for (RegistryKey<World> key : WorldUnloader.RESET_DIMENSIONS) {
             ServerWorld world = server.getWorld(key);
-            if (world != null) {
-                WorldInjectionUtils.clearAllEntities(world);
+            if (world == null) continue;
 
-                // Wipes blockEntityTickers and pendingBlockEntityTickers
-                try {
-                    for (java.lang.reflect.Field field : net.minecraft.world.World.class.getDeclaredFields()) {
-                        if (java.util.List.class.isAssignableFrom(field.getType())) {
-                            field.setAccessible(true);
-                            java.util.List<?> list = (java.util.List<?>) field.get(world);
-                            if (list != null) {
-                                list.clear();
-                            }
-                        }
-                    }
-                } catch (Exception e) {
-                    HardcoreWorldReset.LOGGER.error("Failed to vaporize ghost block entities!", e);
+            WorldInjectionUtils.clearAllEntities(world);
+
+            // With no ticket left the engine lowers every chunk level itself and unloads the
+            // chunks through its own path over the next ticks, which is the only way the
+            // block entity tickers, scheduled ticks, POIs and light data get cleaned up too.
+            int released = WorldInjectionUtils.releaseAllChunkTickets(world);
+            HardcoreWorldReset.LOGGER.info("Released {} chunk ticket(s) in {}; {} chunk(s) loaded.",
+                    released, key.getValue(), WorldInjectionUtils.countLoadedChunks(world));
+        }
+
+        drainTicks = 0;
+        ioTicks = 0;
+        pendingIo = null;
+        advanceTo(ResetPhase.DRAINING, 0);
+    }
+
+    // Runs every tick until the old world is out of memory and off the io queues
+    private static void executeDrainPhase(MinecraftServer server) {
+        if (pendingIo == null) {
+            drainTicks++;
+
+            boolean idle = true;
+            int loaded = 0;
+            for (RegistryKey<World> key : WorldUnloader.RESET_DIMENSIONS) {
+                ServerWorld world = server.getWorld(key);
+                if (world == null) continue;
+
+                // The server's own pass over the unload queue stops when the tick budget runs
+                // out; an extra unbounded pass per tick gets through it in a handful of ticks
+                world.getChunkManager().tick(() -> true, false);
+
+                if (!WorldInjectionUtils.isChunkEngineIdle(world)) {
+                    idle = false;
+                    loaded += WorldInjectionUtils.countLoadedChunks(world);
                 }
             }
+
+            if (!idle && drainTicks < MAX_UNLOAD_TICKS) {
+                if (drainTicks % 100 == 0) {
+                    HardcoreWorldReset.LOGGER.info("Still unloading the old world: {} chunk(s) left after {} ticks.", loaded, drainTicks);
+                }
+                return;
+            }
+
+            if (idle) {
+                HardcoreWorldReset.LOGGER.info("The old world is fully unloaded after {} tick(s).", drainTicks);
+            } else {
+                HardcoreWorldReset.LOGGER.warn("{} chunk(s) refused to unload within {} ticks; dropping them.", loaded, MAX_UNLOAD_TICKS);
+                for (RegistryKey<World> key : WorldUnloader.RESET_DIMENSIONS) {
+                    ServerWorld world = server.getWorld(key);
+                    if (world == null) continue;
+                    // A player still standing in a doomed dimension keeps its chunks alive and
+                    // is the usual reason for this; name them so the log explains itself
+                    for (ServerPlayerEntity player : world.getPlayers()) {
+                        HardcoreWorldReset.LOGGER.warn("{} is still in {} during the reset.", player.getName().getString(), key.getValue());
+                    }
+                    WorldInjectionUtils.dropRemainingChunks(world);
+                }
+            }
+
+            // From here until the new world is ready nothing may save: no autosave, and (as a
+            // side effect of this flag) no more chunk unloads either, so no new writes reach
+            // the io workers behind the cleanup below.
+            setSavingDisabled(server, true);
+
+            // The generators switch to the new seed right now, while nothing is loaded. Any
+            // chunk that gets loaded from here on, for whatever reason, is generated for the
+            // new world; a window with the old seed still in place is how old terrain ended
+            // up next to new terrain at spawn.
+            applyNewSeed(server);
+
+            // Each io worker drops its queue, closes its region files and deletes its own
+            // folder (region, poi, entities) on its own thread
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
+            for (RegistryKey<World> key : WorldUnloader.RESET_DIMENSIONS) {
+                ServerWorld world = server.getWorld(key);
+                if (world != null) futures.add(WorldInjectionUtils.discardStorage(world));
+            }
+            pendingIo = CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
+            ioTicks = 0;
+            return;
         }
 
-        // Revoke the permanent spawn chunks memory lock
-        ServerWorld overworld = server.getWorld(World.OVERWORLD);
-        if (overworld != null) {
-            overworld.getChunkManager().removeTicket(
-                    ChunkTicketType.START, new ChunkPos(overworld.getSpawnPos()), 11, Unit.INSTANCE
-            );
+        ioTicks++;
+        if (!pendingIo.isDone() && ioTicks < MAX_IO_TICKS) return;
+        if (!pendingIo.isDone()) {
+            HardcoreWorldReset.LOGGER.warn("The io workers did not drop their queues within {} ticks; deleting anyway.", MAX_IO_TICKS);
+        }
+        pendingIo = null;
+
+        for (RegistryKey<World> key : WorldUnloader.RESET_DIMENSIONS) {
+            ServerWorld world = server.getWorld(key);
+            if (world != null) WorldInjectionUtils.clearPointOfInterestMemory(world);
         }
 
-        // Stop the engine from writing to the worlds we are about to erase.
-        // This replaces a blocking saveAll(flush = true): flushing parks the server thread
-        // on StorageIoWorker.completeAll() until every queued chunk write reports back, and
-        // that future can stay unfinished forever once the reset has torn entities and block
-        // entity tickers out from under it. On a dedicated server the Watchdog then kills the
-        // process after max-tick-time (60s by default); singleplayer has no Watchdog, which is
-        // why this only ever showed up on real servers. Saving a world moments before deleting
-        // its region files is pointless anyway, and skipping it also stops late writes from
-        // recreating the files the DELETING phase is removing.
-        setSavingDisabled(server, true);
-
-        // Advance to the deleting phase after 40 ticks
-        // This wait perfectly ensures no dropped items are ticking when we wipe the ram
-        advanceTo(ResetPhase.DELETING);
+        advanceTo(ResetPhase.DELETING, 0);
     }
 
     private static void setSavingDisabled(MinecraftServer server, boolean disabled) {
@@ -210,17 +299,22 @@ public class WorldResetManager {
         HardcoreWorldReset.LOGGER.info("Phase: DELETING");
         server.getPlayerManager().broadcast(Text.literal("§5[Reset] §7Borrando los archivos del mundo anterior..."), false);
 
+        // Block entity tickers of chunks that had to be dropped instead of unloaded
         for (RegistryKey<World> key : WorldUnloader.RESET_DIMENSIONS) {
             ServerWorld world = server.getWorld(key);
-            if (world != null) {
-                // Now we clear the main RAM and it doesn't crash because entities are dead
-                WorldInjectionUtils.lobotomizeChunkManager(world);
-
-                // Clear the io buffer too
-                WorldInjectionUtils.lobotomizeStorageIO(world);
-
-                // Rip the file handles away from OS
-                WorldInjectionUtils.forceCloseRegionFiles(world);
+            if (world == null) continue;
+            try {
+                for (Field field : World.class.getDeclaredFields()) {
+                    if (List.class.isAssignableFrom(field.getType())) {
+                        field.setAccessible(true);
+                        List<?> list = (List<?>) field.get(world);
+                        if (list != null) {
+                            list.clear();
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                HardcoreWorldReset.LOGGER.error("Failed to vaporize ghost block entities!", e);
             }
         }
 
@@ -234,32 +328,83 @@ public class WorldResetManager {
                 else
                     dimPath = worldFolder.resolve("dimensions").resolve(key.getValue().getNamespace()).resolve(key.getValue().getPath());
 
-                deleteFolder(dimPath.resolve("region"));
-                deleteFolder(dimPath.resolve("poi"));
-                deleteFolder(dimPath.resolve("entities"));
+                // Normally gone already, deleted by the io workers themselves in the DRAINING
+                // phase; this only catches a storage no worker was found for
+                WorldInjectionUtils.deleteFolder(dimPath.resolve("region"));
+                WorldInjectionUtils.deleteFolder(dimPath.resolve("poi"));
+                WorldInjectionUtils.deleteFolder(dimPath.resolve("entities"));
 
                 // Saved world state that outlives its terrain: raids keep pointing at villages
                 // that no longer exist, and the random sequences keep the old world's loot rolls.
+                // The in-memory copies are replaced in the REGENERATING phase.
                 // scoreboard.dat deliberately stays, since it holds the lives objective.
                 deleteFile(dimPath.resolve("data").resolve("raids.dat"));
+                deleteFile(dimPath.resolve("data").resolve("raids_end.dat"));
                 deleteFile(dimPath.resolve("data").resolve("random_sequences.dat"));
             }
 
             HardcoreWorldReset.LOGGER.info("Wiping player data, stats, and advancements...");
-            deleteFolder(worldFolder.resolve("advancements"));
-            deleteFolder(worldFolder.resolve("stats"));
-            deleteFolder(worldFolder.resolve("playerdata"));
+            WorldInjectionUtils.deleteFolder(worldFolder.resolve("advancements"));
+            WorldInjectionUtils.deleteFolder(worldFolder.resolve("stats"));
+            WorldInjectionUtils.deleteFolder(worldFolder.resolve("playerdata"));
 
             try {
-                java.nio.file.Files.createDirectories(worldFolder.resolve("advancements"));
-                java.nio.file.Files.createDirectories(worldFolder.resolve("stats"));
-                java.nio.file.Files.createDirectories(worldFolder.resolve("playerdata"));
-            } catch (java.io.IOException e) {
+                Files.createDirectories(worldFolder.resolve("advancements"));
+                Files.createDirectories(worldFolder.resolve("stats"));
+                Files.createDirectories(worldFolder.resolve("playerdata"));
+            } catch (IOException e) {
                 HardcoreWorldReset.LOGGER.error("Failed to recreate player folders.", e);
             }
         }
 
-        advanceTo(ResetPhase.REGENERATING);
+        advanceTo(ResetPhase.REGENERATING, PHASE_DELAY_TICKS);
+    }
+
+    // Points every generator, cache and seed holder of the reset dimensions at the new seed.
+    // Called the moment the chunk engine is empty, before anything can load a chunk again.
+    private static void applyNewSeed(MinecraftServer server) {
+        ServerWorld overworld = server.getWorld(World.OVERWORLD);
+        List<ServerWorld> worlds = new ArrayList<>();
+
+        for (RegistryKey<World> key : WorldUnloader.RESET_DIMENSIONS) {
+            ServerWorld world = server.getWorld(key);
+            if (world == null) continue;
+            worlds.add(world);
+
+            ServerChunkManager manager = world.getChunkManager();
+            ChunkGenerator chunkGen = manager.getChunkGenerator();
+
+            // Same recipe the engine uses when it opens a world: noise generators bring their
+            // own settings, anything else gets the placeholder ones
+            ChunkGeneratorSettings settings = chunkGen instanceof NoiseChunkGenerator noiseGen
+                    ? noiseGen.getSettings().value()
+                    : ChunkGeneratorSettings.createMissingSettings();
+            NoiseConfig newConfig = NoiseConfig.create(
+                    settings,
+                    server.getRegistryManager().getWrapperOrThrow(RegistryKeys.NOISE_PARAMETERS),
+                    newSeed
+            );
+            injectByType(manager.chunkLoadingManager, NoiseConfig.class, newConfig);
+
+            try {
+                StructurePlacementCalculator newCalculator = chunkGen.createStructurePlacementCalculator(
+                        server.getRegistryManager().getWrapperOrThrow(RegistryKeys.STRUCTURE_SET),
+                        newConfig, newSeed
+                );
+                injectByType(manager.chunkLoadingManager, StructurePlacementCalculator.class, newCalculator);
+                newCalculator.tryCalculate();
+            } catch (Exception e) {
+                HardcoreWorldReset.LOGGER.error("Failed to rebuild the structure placement of {}", key.getValue(), e);
+            }
+
+            WorldInjectionUtils.injectSeedIntoMemory(world, newSeed);
+            WorldInjectionUtils.refreshStructureLocator(world, newConfig, newSeed);
+        }
+
+        if (overworld != null) {
+            WorldInjectionUtils.resetRandomSequences(overworld, worlds, newSeed);
+        }
+        HardcoreWorldReset.LOGGER.info("The generators now run on seed {}.", newSeed);
     }
 
     private static void executeRegenerationPhase(MinecraftServer server) {
@@ -275,35 +420,12 @@ public class WorldResetManager {
             ServerWorld world = server.getWorld(key);
             if (world == null) continue;
 
-            ServerChunkManager manager = world.getChunkManager();
-            net.minecraft.world.gen.chunk.ChunkGenerator chunkGen = manager.getChunkGenerator();
-
-            if (chunkGen instanceof NoiseChunkGenerator noiseGen) {
-                NoiseConfig newConfig = NoiseConfig.create(
-                        noiseGen.getSettings().value(),
-                        server.getRegistryManager().getWrapperOrThrow(RegistryKeys.NOISE_PARAMETERS),
-                        newSeed
-                );
-
-                injectByType(manager, NoiseConfig.class, newConfig);
-                injectByType(manager.chunkLoadingManager, NoiseConfig.class, newConfig);
-
-                try {
-                    net.minecraft.world.gen.chunk.placement.StructurePlacementCalculator newCalculator =
-                            chunkGen.createStructurePlacementCalculator(
-                                    server.getRegistryManager().getWrapperOrThrow(RegistryKeys.STRUCTURE_SET),
-                                    newConfig, newSeed
-                            );
-                    injectByType(manager.chunkLoadingManager, net.minecraft.world.gen.chunk.placement.StructurePlacementCalculator.class, newCalculator);
-                } catch (Exception e) {
-                }
-            }
-
-            WorldInjectionUtils.injectSeedIntoMemory(world, newSeed);
+            WorldInjectionUtils.resetRaids(world);
 
             if (key.equals(World.OVERWORLD)) {
                 world.setTimeOfDay(0L);
-                // Temporary dummy spawn to prevent crashes
+                // Temporary dummy spawn to prevent crashes. Vanilla starts loading the spawn
+                // chunks around it right away, with the generators already on the new seed.
                 world.setSpawnPos(new net.minecraft.util.math.BlockPos(0, 200, 0), 0.0f);
             }
 
@@ -312,14 +434,14 @@ public class WorldResetManager {
             }
         }
 
-        advanceTo(ResetPhase.DONE);
+        advanceTo(ResetPhase.DONE, PHASE_DELAY_TICKS);
     }
 
     private static void executeDonePhase(MinecraftServer server) {
         HardcoreWorldReset.LOGGER.info("Phase: DONE");
 
         // We advance to IDLE immediately outside the execute block so the tick loop doesn't fire this multiple times
-        advanceTo(ResetPhase.IDLE);
+        advanceTo(ResetPhase.IDLE, 0);
 
         server.execute(() -> {
             // While the Limbo arena is running, the players stay there and the arena hands the
@@ -380,30 +502,9 @@ public class WorldResetManager {
                 newSpawn = new net.minecraft.util.math.BlockPos(0, fallbackY, 0);
             }
 
-            // Set the actual world spawn to the spawn we just calculated
+            // Set the actual world spawn to the spawn we just calculated. Vanilla moves the
+            // spawn chunk ticket along with it, sized by the spawnChunkRadius game rule.
             overworld.setSpawnPos(newSpawn, 0.0f);
-
-            // Add ticket to load chunks around 0,0 safely
-            int spawnRadius = server.getGameRules().getInt(net.minecraft.world.GameRules.SPAWN_CHUNK_RADIUS);
-            overworld.getChunkManager().addTicket(
-                    net.minecraft.server.world.ChunkTicketType.START,
-                    new net.minecraft.util.math.ChunkPos(newSpawn),
-                    spawnRadius,
-                    net.minecraft.util.Unit.INSTANCE
-            );
-        }
-
-        // I'm trying to optimize ram usage but idk if it's gonna do something
-        for (RegistryKey<World> key : WorldUnloader.RESET_DIMENSIONS) {
-            if (key.equals(World.OVERWORLD)) continue;
-
-            ServerWorld world = server.getWorld(key);
-            if (world != null) {
-                ServerChunkManager manager = world.getChunkManager();
-                for (int i = 0; i < 50; i++) {
-                    manager.tick(() -> false, true);
-                }
-            }
         }
 
         System.gc();
@@ -422,11 +523,15 @@ public class WorldResetManager {
     // Called straight from finishReset() when there is no arena, or by the arena when it ends.
     public static void exitLimbo(MinecraftServer server) {
         try {
+            // Clients that asked to respawn while the world was being erased get it now
+            PlayerRespawner.flushDeferredRefreshes(server);
+
             ServerWorld overworld = server.getWorld(World.OVERWORLD);
             if (overworld != null) {
                 net.minecraft.util.math.BlockPos spawn = overworld.getSpawnPos();
 
-                for (net.minecraft.server.network.ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
+                for (ServerPlayerEntity player : new ArrayList<>(server.getPlayerManager().getPlayerList())) {
+                    player = PlayerRespawner.ensureAlive(server, player);
                     if (player.getServerWorld().getRegistryKey() == com.frankloq.LimboDimension.LIMBO_KEY) {
 
                         // The Limbo track ends here; the reset stinger plays on arrival
@@ -528,24 +633,9 @@ public class WorldResetManager {
         }
     }
 
-    private static void deleteFolder(Path path) {
-        if (!Files.exists(path)) return;
-        try (Stream<Path> walk = Files.walk(path)) {
-            walk.sorted(Comparator.reverseOrder()).forEach(p -> {
-                try {
-                    Files.delete(p);
-                } catch (IOException e) {
-                    HardcoreWorldReset.LOGGER.error("windows won't fucking allow this file to removed bc is a lil child: " + p.getFileName(), e);
-                }
-            });
-        } catch (IOException e) {
-            HardcoreWorldReset.LOGGER.error("Failed to read folder: " + path, e);
-        }
-    }
-
-    private static void advanceTo(ResetPhase phase) {
+    private static void advanceTo(ResetPhase phase, int delayTicks) {
         currentPhase = phase;
-        phaseTimer = PHASE_DELAY_TICKS;
+        phaseTimer = delayTicks;
     }
 
     private static Long getFixedSeed(MinecraftServer server) {
